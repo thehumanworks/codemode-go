@@ -86,18 +86,23 @@ Semantics:
 - The return value reaches the host through a closure-held host function the
   driver calls once (first report wins) and is checked with `json.Valid`;
   a script cannot forge it through a global.
-- The prelude removes `__host_*`, the quickjs-libc globals (`std`, `os`,
-  `bjson`, `print`, `setTimeout`, `setInterval`, `clearTimeout`,
-  `clearInterval`, `scriptArgs`, `gc`) and qjs's `QJS_PROXY_VALUE` from
-  `globalThis`, pins `Function.prototype.call`/`apply`, and `__drive` removes
-  itself on first use. The VM's filesystem root is an empty read-only
-  directory, its stdout/stderr go to `io.Discard`, it has no environment and
-  no network. A dynamic `import("qjs:os")`/`import("qjs:std")` still works
-  (the module loader is C-level): it can list the empty root, fail to write,
-  sleep, set libc timers, or call `std.exit`. Exit becomes a `ScriptError`
-  mentioning `exit(N)`; a sleep or timer cannot be interrupted, so Run
-  returns a `TimeoutError` after the deadline plus a grace period (1s) and
-  the VM goroutine ends when the sleep does.
+- The VM is the library's own QuickJS-ng build without quickjs-libc
+  (`wasm/qjs.wasm`, passed through `qjs.Option.QuickJSWasmBytes`; sources,
+  pinned commits and build script under `wasm/`). It has no `qjs:std`,
+  `qjs:os` or `qjs:bjson`, no `print`, `scriptArgs`, timers or `std.exit`,
+  and its module loader throws `ReferenceError: could not load module`, so
+  `import()` of anything fails. `js_std_await`/`js_std_loop`, which the qjs
+  glue uses to settle top-level promises, are replaced by job-queue drivers
+  that raise an `InternalError` when a promise can never settle instead of
+  polling for I/O that does not exist.
+- The prelude still removes `__host_*`, the quickjs-libc global names (none
+  exist in this build; defence in depth) and qjs's `QJS_PROXY_VALUE` from
+  `globalThis`, pins `Function.prototype.call`/`apply`, and `__drive`
+  removes itself on first use. The VM also gets an empty read-only
+  directory as its filesystem root, `io.Discard` for stdout/stderr, no
+  environment and no network, which would contain a stock qjs module too.
+  Nothing in the VM can block, so the deadline interrupts a script at its
+  next loop iteration or call; the 1s grace in `Run` is a backstop.
 - The script starts on line 1 of `script.js`, so stack traces match the
   model's code; prelude frames are stripped.
 
@@ -256,7 +261,9 @@ JSON text block when Content is empty or the output is not an object; `Out`
 skipped when InputRequests is set); the output is validated against the
 output schema with defaults ("validating tool output: ..."). Untyped tools
 get no validation and no defaults; empty, `null` or `undefined` arguments
-become `{}`. A handler panic rejects the call with `tool "X" panicked: ...`.
+become `{}`. A handler panic rejects the call with `tool "X" panicked: ...`;
+the handler registered on the server is wrapped the same way, so a direct
+client call gets an error result with that text instead of a dead process.
 `UnwrapResult` then turns the result into the script's value: error →
 reject; `IsError` → reject with the text; `StructuredContent` (JSON `null`
 counts as absent) → its JSON; one text block that parses as a JSON object or
@@ -310,12 +317,19 @@ tests use `mcp.NewInMemoryTransports` with a real `*mcp.Server` and
 - `MaxExecutionTime` is not enforced; the hard timeout is the ctx deadline
   closing the module. `Eval` and `rt.Close()` then panic and are recovered.
   wazero checks the ctx at function calls and loop back-edges, not inside a
-  host call: `os.sleep` and libc timers (`WithSysNanosleep`) block until
-  they end, hence the VM goroutine and the grace period in `Run`.
-- The wasm build includes quickjs-libc (`qjs:std`, `qjs:os`, `qjs:bjson`,
+  host call: with the stock wasm, `os.sleep` and libc timers
+  (`WithSysNanosleep`) block until they end, which is why the VM runs on its
+  own goroutine with a grace period in `Run`, and why the library ships a
+  build without quickjs-libc.
+- The stock wasm includes quickjs-libc (`qjs:std`, `qjs:os`, `qjs:bjson`,
   `js_std_add_helpers`); `Option.CWD` defaults to the process working
   directory mounted at "/" and `Stdout`/`Stderr` to the real ones, so the
-  sandbox always sets all three.
+  sandbox sets all three even though its own build cannot reach them.
+- `Option.QuickJSWasmBytes` replaces the compiled module whenever the hash
+  of the bytes differs from the cached one, process-wide. Another qjs user
+  in the same process that creates runtimes with the stock bytes makes the
+  two alternate recompiles (about 300ms each); the sandbox still works, and
+  its `Warm` self-test still guards the `CloseOnContextDone` flag.
 - Values returned from `Eval`/`Invoke` are unreliable for short-lived
   strings; the result travels through the `__host_result` host function.
 - `SetAsyncFunc` resolves synchronously; async host calls use the

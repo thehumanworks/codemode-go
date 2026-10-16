@@ -16,13 +16,10 @@
 //   - any extra globals, as async functions taking positional arguments
 //     (package catalog provides search and describe);
 //   - console.log and friends, captured for the host;
-//   - plain ECMAScript. The quickjs-libc helpers the underlying qjs build
-//     ships (std, os, print, setTimeout and friends) are removed from the
-//     global object; the VM's filesystem root is an empty read-only
-//     directory, its stdout and stderr are discarded, and it has no network
-//     and no environment. A dynamic import("qjs:os") can still reach the libc
-//     module; the README lists what that leaves open (a blocking sleep is the
-//     one that matters, and Run still returns on time).
+//   - plain ECMAScript, and nothing else. The embedded QuickJS build has no
+//     quickjs-libc (see wasm/README.md): no std, os or bjson modules, no
+//     print, no timers, no files, no environment, no network, no exit, and
+//     no module loader, so import() of anything fails.
 //
 // The code runs as the body of an async function, so it can use await at the
 // top level and return a value. Independent calls run concurrently with
@@ -49,6 +46,13 @@ import (
 
 //go:embed prelude.js
 var preludeSource string
+
+// qjsWasm is QuickJS compiled without quickjs-libc (see wasm/README.md): no
+// std/os/bjson modules, no files, timers or process access exist inside the
+// VM at all, so there is nothing for a script to import.
+//
+//go:embed wasm/qjs.wasm
+var qjsWasm []byte
 
 // HostFunc handles one call from a script. args is the JSON the script
 // passed: an object for tools, an array of positional arguments for
@@ -175,8 +179,10 @@ var (
 	// sandboxRoot is the empty read-only directory the VM sees as "/".
 	sandboxRoot string
 	// vmStopGrace is how long Run waits for the VM to stop after the
-	// deadline before returning without it (a libc sleep cannot be
-	// interrupted). A variable so tests can shorten it.
+	// deadline before returning without it. wazero interrupts the VM at
+	// the next call or loop back-edge, so this is a backstop; nothing in
+	// the embedded build can block inside the VM. A variable so tests can
+	// shorten it.
 	vmStopGrace = time.Second
 )
 
@@ -236,6 +242,7 @@ func warm() {
 func vmOption(ctx context.Context, memory int, recompile bool) qjs.Option {
 	return qjs.Option{
 		Context:            ctx,
+		QuickJSWasmBytes:   qjsWasm,
 		CloseOnContextDone: true,
 		DisableBuildCache:  recompile,
 		MemoryLimit:        memory,
@@ -612,9 +619,9 @@ func cleanJSError(msg string) string {
 	return strings.TrimRight(strings.Join(keep, "\n"), "\n")
 }
 
-// crashMessage describes a panic from the VM. A script that reaches the
-// libc exit through import("qjs:std") ends the module with an exit code;
-// anything else is reported as is, shortened.
+// crashMessage describes a panic from the VM. A wasm exit (nothing in the
+// embedded build calls one, but a stock qjs module would on std.exit) is
+// reported with its code; anything else is reported as is, shortened.
 func crashMessage(rec string) string {
 	if i := strings.Index(rec, "exit_code("); i >= 0 {
 		code := rec[i+len("exit_code("):]

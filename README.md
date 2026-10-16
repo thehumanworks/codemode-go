@@ -18,11 +18,11 @@ The library follows the pattern that Cloudflare's
 
 The sandbox is QuickJS compiled to WebAssembly, executed by
 [wazero](https://wazero.io) through [fastschema/qjs](https://github.com/fastschema/qjs).
-No cgo. The VM has no network, no environment, an empty read-only filesystem
-and discarded stdio; the libc helpers (`std`, `os`, `print`, `setTimeout`)
-are removed from the global object. Every run is bounded by a wall-clock
-timeout, a heap limit, a host-call budget, a concurrency cap and a console
-cap.
+No cgo. The library ships its own QuickJS build without quickjs-libc, so
+the VM has no files, timers, environment, network, process access or module
+loader: a script can only compute and call the host functions it was given.
+Every run is bounded by a wall-clock timeout, a heap limit, a host-call
+budget, a concurrency cap and a console cap.
 
 ```
 github.com/thehumanworks/codemode-go           the sandbox (no other dependencies of yours)
@@ -157,8 +157,9 @@ go codemode.Warm()
 from the handler's input type when the tool gives none, and registers a copy
 of the tool on the server exactly as the SDK would. A script call behaves
 like the same call over the wire: arguments are validated and defaulted,
-output is validated, the handler sees the code tool's session, and a panic
-in a handler rejects the call instead of ending the process. A parity test
+output is validated, and the handler sees the code tool's session. A panic
+in a handler becomes an error result, whether the call came from a script or
+directly from a client (the SDK alone would end the process). A parity test
 compares every case through a real client. Name collisions (two tools that
 would become the same member, or a tool named like the code tool) panic at
 registration. Results are unwrapped the way Cloudflare's codemode does:
@@ -231,17 +232,17 @@ process. The timeout is enforced by closing the WebAssembly module, which
 stops a tight loop as well as a stuck host call; in-flight host calls see
 their context cancelled and get one second to return.
 
-The qjs build ships quickjs-libc. The prelude deletes its globals, the VM's
-filesystem root is an empty read-only directory, stdout and stderr go to
-`io.Discard`, and there is no environment and no network. What remains is
-`import("qjs:os")` or `import("qjs:std")`, which cannot be blocked from
-JavaScript: a script can list the empty directory, fail to write to it,
-call `std.exit` (reported as a `ScriptError`), or sleep with `os.sleep` and
-libc timers. wazero cannot interrupt a sleep, so `Run` returns a
-`TimeoutError` after the deadline plus a one-second grace period and the VM
-goroutine finishes when the sleep does. A qjs build without quickjs-libc
-would close that gap; until then a script can hold a goroutine and the VM's
-memory for at most the length of its sleep.
+The embedded `wasm/qjs.wasm` is QuickJS-ng compiled without quickjs-libc
+([wasm/README.md](wasm/README.md) has the pinned sources and the build
+script). The `qjs:std`, `qjs:os` and `qjs:bjson` modules, `print`,
+`scriptArgs`, timers, `std.exit` and the file-backed module loader do not
+exist in it, so `import()` of anything throws a `ReferenceError`. The VM
+also runs with an empty read-only directory as its filesystem root, stdout
+and stderr sent to `io.Discard`, no environment and no network, which only
+matters if a stock qjs module were ever substituted. As a result nothing
+inside the VM can block: the deadline interrupts a script at its next loop
+iteration or call, and the one-second grace in `Run` is a backstop that is
+not expected to be reached.
 
 A script is untrusted input: it can only do what your `HostFunc`s do, so put
 authorisation and rate limits in them, not in the prompt.
@@ -274,3 +275,10 @@ go vet ./... && gofmt -l .
 ```
 
 `DESIGN.md` holds the API contract the packages are built to.
+`wasm/README.md` documents the embedded QuickJS build and how to rebuild it.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The QuickJS glue under `wasm/glue` is from
+[fastschema/qjs](https://github.com/fastschema/qjs) (MIT, `wasm/glue/LICENSE`);
+QuickJS-ng is MIT as well.

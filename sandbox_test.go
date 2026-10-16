@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/fastschema/qjs"
 )
 
 func testTools() []Tool {
@@ -302,53 +304,77 @@ func TestSandboxIsolation(t *testing.T) {
 	if string(out.Result) != `["undefined","undefined","undefined"]` {
 		t.Errorf("libc globals still visible: %s", out.Result)
 	}
-	// What a dynamic import of the libc modules can reach: an empty
-	// read-only root, no environment, discarded output.
+	// The embedded build has no module loader and no libc modules, so a
+	// dynamic import of anything fails.
 	out, err = run(t, `
-		let os, std;
-		try { os = await import("qjs:os"); std = await import("qjs:std"); } catch (e) { return "import failed"; }
-		const [ents] = os.readdir("/");
-		const f = std.open("/x.txt", "w");
-		if (f) { f.close(); }
-		std.out.puts("codemode isolation test: this line must not reach the process stdout\n");
-		return {ents, cwd: os.getcwd()[0], passwd: std.loadFile("/etc/passwd"), env: Object.keys(std.getenviron()).length, wrote: f !== null, exec: typeof os.exec};`, Options{})
+		const out = {};
+		for (const m of ["qjs:os", "qjs:std", "qjs:bjson", "./x.js", "fs"]) {
+			try { await import(m); out[m] = "loaded"; } catch (e) { out[m] = e.constructor.name + ": " + e.message; }
+		}
+		return out;`, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(out.Result); got != `"import failed"` && got != `{"ents":[".",".."],"cwd":"/","passwd":null,"env":0,"wrote":false,"exec":"undefined"}` {
-		t.Errorf("libc reach: %s", got)
+	var got map[string]string
+	if err := json.Unmarshal(out.Result, &got); err != nil || len(got) != 5 {
+		t.Fatalf("imports: %s %v", out.Result, err)
+	}
+	for m, msg := range got {
+		// QuickJS normalises the specifier ("./x.js" becomes "x.js"), so
+		// only the error class and the loader's wording are checked.
+		if !strings.HasPrefix(msg, "ReferenceError: could not load module '") || !strings.HasSuffix(msg, "': this sandbox has no module loader") {
+			t.Errorf("import(%q): %s", m, msg)
+		}
 	}
 }
 
-func TestRunReturnsWhileVMSleeps(t *testing.T) {
+func TestWasmHasNoLibc(t *testing.T) {
+	// Before the prelude runs, the raw VM must already lack every
+	// quickjs-libc name; the prelude's deletions are defence in depth, not
+	// the isolation boundary. (gc and navigator are qjs's own harmless
+	// globals, and the prelude removes gc.)
+	Warm()
+	if warmErr != nil {
+		t.Fatal(warmErr)
+	}
+	rt, err := qjs.New(vmOption(context.Background(), 16<<20, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	var seen string
+	rt.Context().SetFunc("__report", func(this *qjs.This) (*qjs.Value, error) {
+		seen = this.Args()[0].String()
+		return this.Context().NewUndefined(), nil
+	})
+	_, err = rt.Context().Eval("probe.js", qjs.Code(`__report(JSON.stringify(["std","os","bjson","print","setTimeout","setInterval","clearTimeout","clearInterval","scriptArgs"].filter(n => n in globalThis)))`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen != `[]` {
+		t.Errorf("libc globals present in the raw VM: %s", seen)
+	}
+}
+
+func TestRunBusyLoopStopsOnTime(t *testing.T) {
 	shortGrace(t)
-	// os.sleep blocks inside the wasm module where the deadline cannot stop
-	// it; Run still returns after the grace period with the logs so far.
-	for _, code := range []string{
-		`console.log("before"); const os = await import("qjs:os"); os.sleep(1500); return "slept"`,
-		`console.log("before"); const os = await import("qjs:os"); await new Promise(r => os.setTimeout(r, 1500)); return "fired"`,
-	} {
-		start := time.Now()
-		_, err := run(t, code, Options{Timeout: 150 * time.Millisecond})
-		var te *TimeoutError
-		if !errors.As(err, &te) {
-			t.Fatalf("%s: want timeout, got %v", code, err)
-		}
-		if d := time.Since(start); d > time.Second {
-			t.Errorf("Run took %s", d)
-		}
-		if len(te.Logs) != 1 || te.Logs[0] != "before" || te.Timeout != 150*time.Millisecond {
-			t.Errorf("timeout error: %+v", te)
-		}
+	// Without libc there is nothing that can block inside the VM; a busy
+	// loop is interrupted at the deadline, well inside the grace period.
+	start := time.Now()
+	_, err := run(t, `console.log("before"); for (;;) {} return "never"`, Options{Timeout: 150 * time.Millisecond})
+	var te *TimeoutError
+	if !errors.As(err, &te) {
+		t.Fatalf("want timeout, got %v", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("Run took %s", d)
+	}
+	if len(te.Logs) != 1 || te.Logs[0] != "before" || te.Timeout != 150*time.Millisecond {
+		t.Errorf("timeout error: %+v", te)
 	}
 }
 
-func TestRunExitAndCrash(t *testing.T) {
-	_, err := run(t, `const std = await import("qjs:std"); std.exit(3); return 1`, Options{})
-	var se *ScriptError
-	if !errors.As(err, &se) || !strings.Contains(se.Message, "exit(3)") {
-		t.Errorf("exit: %v", err)
-	}
+func TestRunToolPanic(t *testing.T) {
 	// A HostFunc that panics rejects the call instead of ending the process.
 	tools := append(testTools(), Tool{Name: "boom", Call: func(context.Context, json.RawMessage) (json.RawMessage, error) { panic("kaboom") }})
 	out, err := Run(context.Background(), `try { await app.boom({}); } catch (e) { return e.message; }`, tools, nil, Options{Namespace: "app"})

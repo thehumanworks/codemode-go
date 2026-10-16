@@ -1,0 +1,285 @@
+diff --git a/qjswasm/eval.c b/qjswasm/eval.c
+index d6d8a47..b55caa5 100644
+--- a/qjswasm/eval.c
++++ b/qjswasm/eval.c
+@@ -5,6 +5,64 @@
+ #include <stdlib.h>
+ #include <stdbool.h>
+ 
++/* Replacements for the two quickjs-libc helpers the glue uses. They drive
++ * the job queue only: there are no timers, file descriptors or workers, so a
++ * promise nobody can settle is reported instead of spinning forever. */
++void js_std_loop(JSContext *ctx)
++{
++    JSRuntime *rt = JS_GetRuntime(ctx);
++    JSContext *ctx1;
++    for (;;)
++    {
++        int err = JS_ExecutePendingJob(rt, &ctx1);
++        if (err == 0)
++            break; /* queue empty */
++        if (err < 0)
++            JS_FreeValue(ctx1, JS_GetException(ctx1)); /* a job threw after the result settled: drop it, as quickjs-libc does (it would print to the discarded stderr) */
++    }
++}
++
++JSValue js_std_await(JSContext *ctx, JSValue obj)
++{
++    JSRuntime *rt = JS_GetRuntime(ctx);
++    for (;;)
++    {
++        JSPromiseStateEnum state = JS_PromiseState(ctx, obj);
++        if (state == JS_PROMISE_FULFILLED)
++        {
++            JSValue ret = JS_PromiseResult(ctx, obj);
++            JS_FreeValue(ctx, obj);
++            return ret;
++        }
++        if (state == JS_PROMISE_REJECTED)
++        {
++            JSValue ret = JS_Throw(ctx, JS_PromiseResult(ctx, obj));
++            JS_FreeValue(ctx, obj);
++            return ret;
++        }
++        if (state != JS_PROMISE_PENDING)
++            return obj; /* not a promise */
++        JSContext *ctx1;
++        int err = JS_ExecutePendingJob(rt, &ctx1);
++        if (err < 0)
++        {
++            JS_FreeValue(ctx, obj);
++            return JS_EXCEPTION;
++        }
++        if (err == 0)
++        {
++            JS_FreeValue(ctx, obj);
++            return JS_ThrowInternalError(ctx, "await: the promise can never settle (nothing is pending and the sandbox has no timers or I/O)");
++        }
++    }
++}
++
++/* import.meta stays empty: there are no files behind modules here. */
++static int js_module_set_import_meta(JSContext *ctx, JSValue func_val, bool use_realpath, bool is_main)
++{
++    return 0;
++}
++
+ /* Detect and load source code from a file or memory.
+  * For file input, returns an allocated buffer (caller must free).
+  * For in-memory input, returns the provided buffer.
+@@ -16,11 +74,8 @@ static uint8_t *detect_buf(JSContext *ctx, QJSEvalOptions *opts, size_t *buf_len
+     // buf_len will be set to the length of the buffer.
+     if (is_file)
+     {
+-        if (!opts->filename || opts->filename[0] == '\0')
+-            return NULL;
+-
+-        opts->filename = detect_entry_point((char *)opts->filename);
+-        return js_load_file(ctx, buf_len, opts->filename);
++        errno = 0;
++        return NULL; /* this build has no filesystem */
+     }
+     // If the input is in-memory, return the provided buffer
+     // and set the buffer length
+@@ -121,101 +176,12 @@ static JSValue load_buf(JSContext *ctx, QJSEvalOptions opts, int flags, bool eva
+     return module_val;
+ }
+ 
+-/* Create a JSON module with the parsed JSON as default export */
+-static JSModuleDef *js_module_loader_json(JSContext *ctx, const char *module_name)
+-{
+-    JSModuleDef *m;
+-    size_t buf_len;
+-    uint8_t *buf;
+-    JSValue json_val, func_val;
+-
+-    buf = js_load_file(ctx, &buf_len, module_name);
+-    if (!buf)
+-    {
+-        JS_ThrowReferenceError(ctx, "could not load JSON module filename '%s'", module_name);
+-        return NULL;
+-    }
+-
+-    /* Parse the JSON content */
+-    json_val = JS_ParseJSON(ctx, (char *)buf, buf_len, module_name);
+-    js_free(ctx, buf);
+-    if (JS_IsException(json_val))
+-        return NULL;
+-
+-    /* Create a synthetic module source that exports the JSON */
+-    const char *module_source_template =
+-        "const __json_data__ = %s;\n"
+-        "export default __json_data__;\n";
+-
+-    /* Convert JSON to string */
+-    JSValue json_str = JS_JSONStringify(ctx, json_val, JS_NULL, JS_NULL);
+-    if (JS_IsException(json_str))
+-    {
+-        JS_FreeValue(ctx, json_val);
+-        return NULL;
+-    }
+-
+-    const char *json_string = JS_ToCString(ctx, json_str);
+-    if (!json_string)
+-    {
+-        JS_FreeValue(ctx, json_val);
+-        JS_FreeValue(ctx, json_str);
+-        return NULL;
+-    }
+-
+-    /* Create the module source */
+-    size_t source_len = strlen(module_source_template) + strlen(json_string) + 1;
+-    char *module_source = malloc(source_len);
+-    if (!module_source)
+-    {
+-        JS_FreeCString(ctx, json_string);
+-        JS_FreeValue(ctx, json_str);
+-        JS_FreeValue(ctx, json_val);
+-        return NULL;
+-    }
+-    snprintf(module_source, source_len, module_source_template, json_string);
+-
+-    /* Compile the module */
+-    func_val = JS_Eval(ctx, module_source, strlen(module_source), module_name,
+-                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+-
+-    /* Cleanup */
+-    free(module_source);
+-    JS_FreeCString(ctx, json_string);
+-    JS_FreeValue(ctx, json_str);
+-    JS_FreeValue(ctx, json_val);
+-
+-    if (JS_IsException(func_val))
+-        return NULL;
+-
+-    /* Set import.meta */
+-    if (js_module_set_import_meta(ctx, func_val, true, false) < 0)
+-    {
+-        JS_FreeValue(ctx, func_val);
+-        return NULL;
+-    }
+-
+-    /* Return the compiled module */
+-    m = JS_VALUE_GET_PTR(func_val);
+-    JS_FreeValue(ctx, func_val);
+-    return m;
+-}
+-
+-/* Module loader with support for appending common suffixes and JSON modules */
++/* Module loader: nothing can be imported in this build. Built-in C modules
++ * are resolved before the loader is consulted, and none are registered. */
+ JSModuleDef *QJS_ModuleLoader(JSContext *ctx, const char *module_name, void *opaque)
+ {
+-    module_name = detect_entry_point((char *)module_name);
+-    if (!module_name)
+-        return NULL;
+-
+-    /* Check if it's a JSON module */
+-    if (js__has_suffix(module_name, ".json"))
+-    {
+-        return js_module_loader_json(ctx, module_name);
+-    }
+-
+-    JSModuleDef *mod = js_module_loader(ctx, module_name, opaque);
+-    return mod;
++    JS_ThrowReferenceError(ctx, "could not load module '%s': this sandbox has no module loader", module_name);
++    return NULL;
+ }
+ 
+ /* Loads a module, compiles it (with import.meta support), and resolves it */
+diff --git a/qjswasm/helpers.c b/qjswasm/helpers.c
+index afd8682..2198815 100644
+--- a/qjswasm/helpers.c
++++ b/qjswasm/helpers.c
+@@ -156,33 +156,7 @@ void js_set_global_objs(JSContext *ctx)
+     JS_FreeValue(ctx, global);
+     JS_FreeValue(ctx, navigator_proto);
+ 
+-    js_std_add_helpers(ctx, 0, 0);
+-
+-    /* make 'std' and 'os' visible to non module code */
+-    const char *str =
+-        "import * as bjson from 'qjs:bjson';\n"
+-        "import * as std from 'qjs:std';\n"
+-        "import * as os from 'qjs:os';\n"
+-        "globalThis.bjson = bjson;\n"
+-        "globalThis.std = std;\n"
+-        "globalThis.os = os;\n"
+-        "globalThis.setTimeout = os.setTimeout;\n"
+-        "globalThis.setInterval = os.setInterval;\n"
+-        "globalThis.clearTimeout = os.clearTimeout;\n"
+-        "globalThis.clearInterval = os.clearInterval;\n";
+-
+-    QJSEvalOptions opts = {
+-        .buf = str,
+-        .filename = "<init_global>",
+-        .eval_flags = JS_EVAL_TYPE_MODULE};
+-
+-    JSValue val = QJS_Eval(ctx, opts);
+-    if (JS_IsException(val))
+-    {
+-        js_std_dump_error(ctx);
+-        exit(1);
+-    }
+-    JS_FreeValue(ctx, val);
++    /* No quickjs-libc helpers: no print, scriptArgs, std, os, bjson or timers. */
+ }
+ 
+ bool file_exists(const char *path)
+diff --git a/qjswasm/qjs.c b/qjswasm/qjs.c
+index 949168b..e155890 100644
+--- a/qjswasm/qjs.c
++++ b/qjswasm/qjs.c
+@@ -4,9 +4,6 @@ JSContext *New_QJSContext(JSRuntime *rt)
+ {
+   JSContext *ctx;
+   ctx = JS_NewContext(rt);
+-  js_init_module_std(ctx, "qjs:std");
+-  js_init_module_os(ctx, "qjs:os");
+-  js_init_module_bjson(ctx, "qjs:bjson");
+   js_set_global_objs(ctx);
+ 
+   return ctx;
+@@ -39,10 +36,6 @@ QJSRuntime *New_QJS(
+   if (max_stack_size > 0)
+     JS_SetMaxStackSize(runtime, max_stack_size);
+ 
+-  /* setup the the worker context */
+-  js_std_set_worker_new_context_func(New_QJSContext);
+-  /* initialize the standard objects */
+-  js_std_init_handlers(runtime);
+   /* loader for ES6 modules */
+   JS_SetModuleLoaderFunc(runtime, NULL, QJS_ModuleLoader, NULL);
+   /* exit on unhandled promise rejections */
+diff --git a/qjswasm/qjs.h b/qjswasm/qjs.h
+index d30e8e4..d1facdf 100644
+--- a/qjswasm/qjs.h
++++ b/qjswasm/qjs.h
+@@ -1,5 +1,5 @@
+ #include "./quickjs/quickjs.h"
+-#include "./quickjs/quickjs-libc.h"
++/* quickjs-libc is deliberately not linked: no std/os/bjson modules, files, timers or process access. */
+ #include "./quickjs/cutils.h"
+ #include <time.h>
+ 
+diff --git a/qjswasm/qjswasm.cmake b/qjswasm/qjswasm.cmake
+index 8fd8607..faaf94f 100644
+--- a/qjswasm/qjswasm.cmake
++++ b/qjswasm/qjswasm.cmake
+@@ -1,8 +1,3 @@
+-macro(add_qjs_libc_if_needed target)
+-    if(NOT QJS_BUILD_LIBC)
+-        target_sources(${target} PRIVATE quickjs-libc.c)
+-    endif()
+-endmacro()
+ macro(add_static_if_needed target)
+     if(QJS_BUILD_CLI_STATIC OR MINGW)
+         target_link_options(${target} PRIVATE -static)
+@@ -43,7 +38,6 @@ add_executable(qjswasm
+     ../qjs.c
+ )
+ 
+-add_qjs_libc_if_needed(qjswasm)
+ add_static_if_needed(qjswasm)
+ 
+ set_target_properties(qjswasm PROPERTIES

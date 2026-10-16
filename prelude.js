@@ -20,7 +20,8 @@
   const hostResult = globalThis.__host_result;
   for (const name of [
     "__host_call", "__host_wait", "__host_log", "__host_result",
-    // quickjs-libc: modules exposed as globals, print, timers, script arguments
+    // quickjs-libc globals. The embedded build has none of them; deleting is
+    // defence in depth against a stock qjs module, and harmless otherwise.
     "std", "os", "bjson", "print", "setTimeout", "setInterval", "clearTimeout", "clearInterval", "scriptArgs", "gc", "QJS_PROXY_VALUE",
   ]) {
     delete globalThis[name];
