@@ -345,6 +345,17 @@ func (r *Registry) find(name string) *entry {
 	return nil
 }
 
+func (r *Registry) findByName(name string) *entry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, e := range r.tools {
+		if e.tool.Name == name {
+			return e
+		}
+	}
+	return nil
+}
+
 // Call invokes a recorded tool the way a script does: by full name, member
 // name, or <namespace>.<member>; arguments validated; result unwrapped.
 func (r *Registry) Call(ctx context.Context, name string, args json.RawMessage) (json.RawMessage, error) {
@@ -538,7 +549,11 @@ func (r *Registry) globals(cat *catalog.Catalog) map[string]codemode.HostFunc {
 		if json.Unmarshal(args, &pos) == nil && len(pos) > 0 {
 			var target string
 			if json.Unmarshal(pos[0], &target) == nil {
-				if e := r.find(strings.TrimSpace(target)); e != nil {
+				// Only full names are mapped here; member names and
+				// paths are the catalogue's business, so a member that
+				// shares its name with a group (api vs api.*) still lists
+				// the group.
+				if e := r.findByName(strings.TrimSpace(target)); e != nil && e.tool.Name != e.member {
 					path, _ := json.Marshal(r.opts.Namespace + "." + e.member)
 					pos[0] = path
 					args, _ = json.Marshal(pos)

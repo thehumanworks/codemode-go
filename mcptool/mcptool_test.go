@@ -445,3 +445,36 @@ func TestDuplicateToolPanics(t *testing.T) {
 	}()
 	reg.AddTool(&mcp.Tool{Name: "x"}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) { return nil, nil })
 }
+
+// A member whose name equals a catalogue group (api vs api.*) must not
+// shadow the group: describe("api") lists the group, the full tool name
+// and the namespace path reach the member.
+func TestDescribeGroupVersusMember(t *testing.T) {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+	reg := New(srv, Options{Namespace: "svc", StripPrefix: "svc_", Mode: ModeOnly, Prepare: func(context.Context, map[string]any) (*RunConfig, error) {
+		return &RunConfig{Entries: []catalog.Entry{{Path: "api.one", Kind: "api_method", Description: "Method one."}}}, nil
+	}})
+	AddTool(reg, &mcp.Tool{Name: "svc_api", Description: "Call the API."}, func(_ context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+		return nil, map[string]any{"ok": true}, nil
+	})
+	reg.Register()
+	ct, st := mcp.NewInMemoryTransports()
+	if _, err := srv.Connect(context.Background(), st, nil); err != nil {
+		t.Fatal(err)
+	}
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "c", Version: "0"}, nil).Connect(context.Background(), ct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+	s, text, isErr := callCode(t, cs, "code", `
+		const [g, byName, byPath] = await Promise.all([describe("api"), describe("svc_api"), describe("svc.api")]);
+		return [g.members.length, g.kind, byName.path, byPath.path];`, nil)
+	if isErr {
+		t.Fatal(text)
+	}
+	b, _ := json.Marshal(s["result"])
+	if string(b) != `[1,"namespace","svc.api","svc.api"]` {
+		t.Errorf("got %s", b)
+	}
+}
