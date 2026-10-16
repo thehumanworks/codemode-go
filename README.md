@@ -122,11 +122,14 @@ const group = await describe("api");     // every api.* entry, one line each
 ```
 
 Search is BM25 over the path, description, keywords and the schema's property
-names, descriptions and enum values, with camelCase splitting and light
-stemming. Describe renders JSON Schema as TypeScript: optional properties,
-JSDoc from descriptions and defaults, enums as literal unions, arrays, tuples,
-`Record<>`, nullable unions, `anyOf`/`oneOf`/`allOf`, and local `$ref`s with
-a depth guard. The lower-level pieces (`TypeOf`, `Declaration`, `NewIndex`)
+names, descriptions and enum values, with camelCase and acronym splitting,
+Unicode words and light stemming; the namespace's own name is ignored in
+queries. Unknown targets get did-you-mean suggestions, nearest member first.
+Describe renders JSON Schema as TypeScript: optional properties, JSDoc from
+descriptions, defaults and constraints, enums as literal unions, arrays,
+tuples, `Record<>`, nullable unions, `anyOf`/`oneOf`/`allOf` narrowing the
+base schema, and local `$ref`s with cycles cut. Schemas can be maps,
+`*jsonschema.Schema` values or raw JSON. The lower-level pieces (`TypeOf`, `Declaration`, `NewIndex`)
 are exported for hosts that render their own documentation.
 
 ## MCP: one code tool for your server

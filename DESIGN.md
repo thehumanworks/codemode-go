@@ -109,7 +109,7 @@ type Entry struct {
     Path        string         // "rex.capture", "api.session.view"; dots separate groups
     Kind        string         // free-form: "tool", "api_method", ...
     Description string
-    Input       any            // JSON Schema of the single argument (map, *jsonschema.Schema, ...); nil = none
+    Input       any            // JSON Schema of the single argument (map, *jsonschema.Schema, raw JSON as json.RawMessage/[]byte/string); nil = none
     Output      any            // JSON Schema of the result; nil = unknown
     Extra       map[string]any // merged into describe() output for this entry, e.g. "call", examples
     Keywords    string         // extra searchable text
@@ -125,7 +125,7 @@ type Options struct {
 
 type Catalog struct{ /* entries, index, byPath */ }
 func New(entries []Entry, opts Options) *Catalog
-func (c *Catalog) Entries() []Entry
+func (c *Catalog) Entries() []Entry             // a fresh slice; Extra is copied, schemas are shared and must not be mutated
 func (c *Catalog) Lookup(path string) (Entry, bool)
 func (c *Catalog) Members() []Member            // namespace members, as declaration members, in entry order
 
@@ -143,15 +143,20 @@ type SearchResult struct {
     Hint      string `json:"hint,omitempty"` // on zero results: suggests describe(ns) and the groups
 }
 func (c *Catalog) Search(query string, limit int) SearchResult   // limit<=0 → DefaultLimit; capped at MaxLimit
+// The namespace's own words (and "tools" while it is the alias) are ignored in
+// queries, so search("rex") alone gives zero results plus the hint.
 
-// Describe resolves a target:
-//   "", ns, "tools"            → {path: ns, kind: "namespace", description, types: Declaration}
+// Describe resolves a target, in this order:
+//   "", ns                     → {path: ns, kind: "namespace", description, types: Declaration}
+//   "tools"                    → the namespace when ns is "tools" or no entry path starts with "tools"; otherwise the group
+//   an exact entry path        → {path, kind, description, types: "type Args = ...;\ntype Result = ...;"} ∪ Extra (copied)
+//                                 (a namespace member also gets call: "await rex.capture({...})")
 //   a group prefix ("api")     → {path, kind: "namespace", members: ["api.x: first sentence", ...] sorted, hint}
-//   a member ("rex.capture", also accepts "capture" and the tool's Name) → {path, kind, description, types, call: "await rex.capture({...})"} ∪ Extra
-//   another entry              → {path, kind, description, types: "type Args = ...;\ntype Result = ...;"} ∪ Extra
-//   unknown                    → error "describe: "x" not found. Did you mean: a, b?" using Search
+//   a bare member ("capture")  → the member (mcptool's wrapper also maps the tool's Name and "<ns>.<Name>")
+//   unknown                    → error "describe: "x" not found. Did you mean: a, b?" — near matches on the last
+//                                 path segment (prefix or small edit distance) first, then Search results
 func (c *Catalog) Describe(target string) (map[string]any, error)
-func (c *Catalog) Declaration() string          // declare const <ns>: { members };
+func (c *Catalog) Declaration() string          // declare const <ns>: { members }; a member whose identifier is already declared is skipped
 func (c *Catalog) Hint() string                 // for codemode.Options.Hint
 func (c *Catalog) Globals() map[string]codemode.HostFunc // "search" and "describe" taking positional JSON args
 func GlobalsDeclaration() string                // declare function search(...) / describe(...) TypeScript
