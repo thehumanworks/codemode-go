@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	codemode "github.com/thehumanworks/codemode-go"
 )
@@ -33,12 +35,16 @@ type Entry struct {
 	// Kind is free-form, e.g. "tool" or "api_method". Members default to "tool".
 	Kind        string
 	Description string
-	// Input is the JSON Schema of the single argument; nil means none.
+	// Input is the JSON Schema of the single argument; nil means none. Any
+	// value that marshals to JSON Schema works, as does raw JSON given as
+	// json.RawMessage, []byte or string (unparseable JSON renders unknown).
 	Input any
-	// Output is the JSON Schema of the result; nil means unknown.
+	// Output is the JSON Schema of the result; nil means unknown. Accepted
+	// forms are those of Input.
 	Output any
 	// Extra is merged into describe() output for this entry, e.g. "call" or
-	// examples. It cannot replace path, kind, description or types.
+	// examples. It cannot replace path, kind, description or types. New
+	// copies the map, and nested maps and slices of JSON-like values.
 	Extra map[string]any
 	// Keywords is extra searchable text.
 	Keywords string
@@ -87,8 +93,13 @@ type group struct {
 	example string // the first entry path under it
 }
 
+// toolsAlias is the target that names the namespace whatever it is called,
+// unless an entry path claims it (see Catalog.Describe).
+const toolsAlias = "tools"
+
 // Catalog is an immutable, searchable set of entries. It is safe for
-// concurrent use.
+// concurrent use. The decoded schemas that Entries, Lookup and Members return
+// are shared with the catalogue by reference and must not be mutated.
 type Catalog struct {
 	opts    Options
 	entries []Entry
@@ -96,14 +107,22 @@ type Catalog struct {
 	members []Member
 	groups  []group
 	index   *Index
+	// aliasActive is true when "tools" names the namespace: the namespace is
+	// "tools", or no entry path starts with a "tools" segment.
+	aliasActive bool
+	// nsTerms are the query tokens that only name the namespace, which every
+	// member matches; Search and did-you-mean ignore them.
+	nsTerms map[string]bool
 }
 
 // New builds a catalogue. Schemas are normalised once through a JSON round
-// trip. Entries with an empty Path are skipped; for a repeated Path the first
-// entry wins.
+// trip and Extra maps are copied, so later changes to the given entries do
+// not reach the catalogue. Entries with an empty Path are skipped; for a
+// repeated Path the first entry wins.
 func New(entries []Entry, opts Options) *Catalog {
 	opts = opts.withDefaults()
-	c := &Catalog{opts: opts, byPath: map[string]int{}}
+	c := &Catalog{opts: opts, byPath: map[string]int{}, nsTerms: map[string]bool{}}
+	toolsSegment := false
 	kinds := map[string]string{}
 	mixed := map[string]bool{}
 	examples := map[string]string{}
@@ -118,6 +137,10 @@ func New(entries []Entry, opts Options) *Catalog {
 		}
 		e.Input = normalize(e.Input)
 		e.Output = normalize(e.Output)
+		e.Extra = cloneExtra(e.Extra)
+		if first, _, _ := strings.Cut(e.Path, "."); first == toolsAlias {
+			toolsSegment = true
+		}
 		if name, ok := c.memberName(e.Path); ok {
 			if e.Kind == "" {
 				e.Kind = "tool"
@@ -144,21 +167,39 @@ func New(entries []Entry, opts Options) *Catalog {
 	}
 	sort.Slice(c.groups, func(i, j int) bool { return c.groups[i].name < c.groups[j].name })
 	c.index = NewIndex(docs)
+	c.aliasActive = opts.Namespace == toolsAlias || !toolsSegment
+	nsWords := opts.Namespace
+	if c.aliasActive {
+		nsWords += " " + toolsAlias
+	}
+	for _, t := range Tokenize(nsWords) {
+		c.nsTerms[t] = true
+	}
 	return c
 }
 
-// Entries returns the entries in order, with schemas normalised.
+// Entries returns a copy of the entries in order, with schemas normalised.
+// Each Extra map is a copy; Input and Output are shared with the catalogue
+// and must not be mutated.
 func (c *Catalog) Entries() []Entry {
-	return append([]Entry(nil), c.entries...)
+	out := make([]Entry, len(c.entries))
+	for i, e := range c.entries {
+		e.Extra = cloneExtra(e.Extra)
+		out[i] = e
+	}
+	return out
 }
 
-// Lookup returns the entry with exactly this path.
+// Lookup returns the entry with exactly this path. Its Extra map is a copy;
+// Input and Output are shared with the catalogue and must not be mutated.
 func (c *Catalog) Lookup(path string) (Entry, bool) {
 	i, ok := c.byPath[path]
 	if !ok {
 		return Entry{}, false
 	}
-	return c.entries[i], true
+	e := c.entries[i]
+	e.Extra = cloneExtra(e.Extra)
+	return e, true
 }
 
 // Members returns the namespace members, as declaration members, in entry order.
@@ -193,13 +234,15 @@ type SearchResult struct {
 }
 
 // Search ranks entries against query with BM25. limit <= 0 means
-// DefaultLimit; it is capped at MaxLimit. Total counts every match.
+// DefaultLimit; it is capped at MaxLimit. Total counts every match. Words
+// that only name the namespace (its name, and "tools" when that is an alias
+// for it) are ignored, since every member would match them.
 func (c *Catalog) Search(query string, limit int) SearchResult {
 	if limit <= 0 {
 		limit = c.opts.DefaultLimit
 	}
 	limit = min(limit, c.opts.MaxLimit)
-	matches := c.index.Search(query, len(c.entries))
+	matches := c.index.search(c.queryTerms(query), len(c.entries))
 	shown := matches[:min(limit, len(matches))]
 	res := SearchResult{
 		Results:   make([]Hit, 0, len(shown)),
@@ -215,6 +258,17 @@ func (c *Catalog) Search(query string, limit int) SearchResult {
 		res.Hint = c.noMatchHint()
 	}
 	return res
+}
+
+// queryTerms tokenizes a query without the words that name the namespace.
+func (c *Catalog) queryTerms(query string) []string {
+	var terms []string
+	for _, t := range Tokenize(query) {
+		if !c.nsTerms[t] {
+			terms = append(terms, t)
+		}
+	}
+	return terms
 }
 
 func (c *Catalog) noMatchHint() string {
@@ -234,11 +288,14 @@ func (c *Catalog) noMatchHint() string {
 //	a group prefix ("api")  {path, kind: "namespace", members: ["api.x: first sentence", ...], hint}
 //	a bare member name      as the member's full path
 //
-// Anything else is an error that suggests close paths.
+// "tools" names the namespace only when the namespace is "tools" or no entry
+// path starts with a "tools" segment; otherwise it is resolved like any
+// other target, usually as the group "tools". Anything else is an error
+// that suggests close paths. The result is a fresh map each call.
 func (c *Catalog) Describe(target string) (map[string]any, error) {
 	target = strings.TrimSuffix(strings.TrimSpace(target), ".")
 	ns := c.opts.Namespace
-	if target == "" || target == ns || target == "tools" {
+	if target == "" || target == ns || (target == toolsAlias && c.aliasActive) {
 		return c.withWarning(map[string]any{
 			"path":        ns,
 			"kind":        "namespace",
@@ -287,7 +344,7 @@ func (c *Catalog) describeEntry(e Entry) map[string]any {
 	}
 	for k, v := range e.Extra {
 		if _, taken := out[k]; !taken || k == "call" {
-			out[k] = v
+			out[k] = cloneValue(v)
 		}
 	}
 	return c.withWarning(out)
@@ -312,10 +369,7 @@ func (c *Catalog) groupLines(prefix string) []string {
 
 func (c *Catalog) notFound(target string) error {
 	msg := fmt.Sprintf("describe: %q not found.", target)
-	var sugg []string
-	for _, m := range c.index.Search(target, maxSuggestions) {
-		sugg = append(sugg, m.Path)
-	}
+	sugg := c.suggest(target)
 	if len(sugg) > 0 {
 		msg += " Did you mean: " + strings.Join(sugg, ", ") + "?"
 	} else {
@@ -325,6 +379,91 @@ func (c *Catalog) notFound(target string) error {
 		msg += " (" + c.opts.Warning + ")"
 	}
 	return errors.New(msg)
+}
+
+// suggest lists up to maxSuggestions paths close to an unknown target:
+// first entries whose last path segment starts with, or is a small edit
+// away from, the target's last segment (closest first, entries under the
+// same parent before others); then BM25 matches for the target's words,
+// without the words that only name the namespace.
+func (c *Catalog) suggest(target string) []string {
+	parent, seg := strings.ToLower(c.opts.Namespace), strings.ToLower(target)
+	if i := strings.LastIndex(seg, "."); i >= 0 {
+		parent, seg = seg[:i], seg[i+1:]
+	}
+	type near struct {
+		path      string
+		dist      int
+		elsewhere bool
+		order     int
+	}
+	var nearby []near
+	if n := utf8.RuneCountInString(seg); n > 0 {
+		maxDist := max(1, n/3)
+		for i, e := range c.entries {
+			ep, es := "", strings.ToLower(e.Path)
+			if j := strings.LastIndex(es, "."); j >= 0 {
+				ep, es = es[:j], es[j+1:]
+			}
+			d := editDistance(seg, es)
+			if d <= maxDist || (n >= 2 && strings.HasPrefix(es, seg)) {
+				nearby = append(nearby, near{path: e.Path, dist: d, elsewhere: ep != parent, order: i})
+			}
+		}
+	}
+	sort.Slice(nearby, func(i, j int) bool {
+		a, b := nearby[i], nearby[j]
+		if a.dist != b.dist {
+			return a.dist < b.dist
+		}
+		if a.elsewhere != b.elsewhere {
+			return !a.elsewhere
+		}
+		return a.order < b.order
+	})
+	var out []string
+	seen := map[string]bool{}
+	add := func(path string) {
+		if len(out) < maxSuggestions && !seen[path] {
+			seen[path] = true
+			out = append(out, path)
+		}
+	}
+	for _, n := range nearby {
+		add(n.path)
+	}
+	for _, m := range c.index.search(c.queryTerms(target), maxSuggestions) {
+		add(m.Path)
+	}
+	return out
+}
+
+// editDistance is the optimal string alignment distance between a and b,
+// counted in runes: insertions, deletions, substitutions and transpositions
+// of adjacent runes each cost one.
+func editDistance(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	prev2 := make([]int, len(rb)+1)
+	prev := make([]int, len(rb)+1)
+	cur := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ra); i++ {
+		cur[0] = i
+		for j := 1; j <= len(rb); j++ {
+			cost := 1
+			if ra[i-1] == rb[j-1] {
+				cost = 0
+			}
+			cur[j] = min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+			if i > 1 && j > 1 && ra[i-1] == rb[j-2] && ra[i-2] == rb[j-1] {
+				cur[j] = min(cur[j], prev2[j-2]+1)
+			}
+		}
+		prev2, prev, cur = prev, cur, prev2
+	}
+	return prev[len(rb)]
 }
 
 // namespaceCalls is describe(ns) followed by describe(group) for every group.
@@ -448,19 +587,79 @@ declare function describe(path: string): Promise<{
 }
 
 // normalize decodes a schema of any Go type into plain JSON values
-// (map[string]any for objects). Values that do not marshal, and typed nils,
-// become nil.
+// (map[string]any for objects). json.RawMessage, []byte and string are taken
+// as raw JSON: empty means no schema, and JSON that does not parse becomes the
+// empty schema, which renders as unknown. Other values that do not marshal,
+// and typed nils, become nil.
 func normalize(schema any) any {
-	if schema == nil {
+	var raw []byte
+	switch s := schema.(type) {
+	case nil:
 		return nil
+	case json.RawMessage:
+		raw = s
+	case []byte:
+		raw = s
+	case string:
+		raw = []byte(s)
+	default:
+		b, err := json.Marshal(schema)
+		if err != nil {
+			return nil
+		}
+		raw = b
 	}
-	b, err := json.Marshal(schema)
-	if err != nil {
+	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
 	var v any
-	if json.Unmarshal(b, &v) != nil {
+	if json.Unmarshal(raw, &v) != nil {
+		return Schema{}
+	}
+	return v
+}
+
+// cloneExtra copies an Extra map with cloneValue; nil stays nil.
+func cloneExtra(m map[string]any) map[string]any {
+	if m == nil {
 		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = cloneValue(v)
+	}
+	return out
+}
+
+// cloneValue deep-copies the JSON-like containers in v (map[string]any,
+// []any, []string, map[string]string); other values are returned as they are.
+func cloneValue(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		return cloneExtra(x)
+	case []any:
+		if x == nil {
+			return x
+		}
+		out := make([]any, len(x))
+		for i, e := range x {
+			out[i] = cloneValue(e)
+		}
+		return out
+	case []string:
+		if x == nil {
+			return x
+		}
+		return append([]string{}, x...)
+	case map[string]string:
+		if x == nil {
+			return x
+		}
+		out := make(map[string]string, len(x))
+		for k, s := range x {
+			out[k] = s
+		}
+		return out
 	}
 	return v
 }

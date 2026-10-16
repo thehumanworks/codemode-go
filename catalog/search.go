@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // Document is one searchable entry: a tool, an API method, or anything else
@@ -27,38 +28,46 @@ var stopWords = map[string]bool{
 }
 
 var (
-	camelRe    = regexp.MustCompile(`([a-z0-9])([A-Z])`)
-	acronymRe  = regexp.MustCompile(`([A-Z]+)([A-Z][a-z])`)
-	nonAlnumRe = regexp.MustCompile(`[^a-z0-9]+`)
+	camelRe = regexp.MustCompile(`([a-z0-9])([A-Z])`)
+	// pluralAcronymRe finds a plural acronym such as IDs or URLs, so it can
+	// lose its "s" before acronymRe would split it as I|Ds.
+	pluralAcronymRe = regexp.MustCompile(`([A-Z]{2,})s(\P{Ll}|$)`)
+	acronymRe       = regexp.MustCompile(`([A-Z]+)([A-Z][a-z])`)
 )
 
-// stem is a naive singulariser so "panes" matches "pane".
+// stem is a naive singulariser so "panes" matches "pane" and "ids" matches "id".
 func stem(t string) string {
 	switch {
 	case len(t) > 4 && strings.HasSuffix(t, "ies"):
 		return t[:len(t)-3] + "y"
 	case len(t) > 4 && (strings.HasSuffix(t, "ches") || strings.HasSuffix(t, "shes") || strings.HasSuffix(t, "sses") || strings.HasSuffix(t, "xes") || strings.HasSuffix(t, "zes")):
 		return t[:len(t)-2]
-	case len(t) > 3 && strings.HasSuffix(t, "s") && !strings.HasSuffix(t, "ss"):
+	case len(t) > 2 && strings.HasSuffix(t, "s") && !strings.HasSuffix(t, "ss"):
 		return t[:len(t)-1]
 	}
 	return t
 }
 
 // Tokenize lowercases, splits camelCase and punctuation, drops stop words,
-// and stems.
+// and stems. Words are runs of letters, digits and combining marks in any
+// script; text without spaces, such as Japanese, stays one token.
 func Tokenize(text string) []string {
 	text = camelRe.ReplaceAllString(text, "$1 $2")
+	text = pluralAcronymRe.ReplaceAllString(text, "${1}${2}")
 	text = acronymRe.ReplaceAllString(text, "$1 $2")
 	text = strings.ToLower(text)
 	var out []string
-	for _, t := range nonAlnumRe.Split(text, -1) {
-		if t == "" || stopWords[t] {
+	for _, t := range strings.FieldsFunc(text, notWordRune) {
+		if stopWords[t] {
 			continue
 		}
 		out = append(out, stem(t))
 	}
 	return out
+}
+
+func notWordRune(r rune) bool {
+	return !unicode.IsLetter(r) && !unicode.IsDigit(r) && !unicode.IsMark(r)
 }
 
 // Index is a prepared BM25 index over documents.
@@ -101,7 +110,12 @@ func NewIndex(docs []Document) *Index {
 // Exact token matches on the path get a boost so a tool named like the
 // query comes first.
 func (idx *Index) Search(query string, limit int) []Match {
-	terms := uniq(Tokenize(query))
+	return idx.search(Tokenize(query), limit)
+}
+
+// search ranks documents for already tokenized query terms.
+func (idx *Index) search(terms []string, limit int) []Match {
+	terms = uniq(terms)
 	if len(terms) == 0 || len(idx.docs) == 0 || limit <= 0 {
 		return nil
 	}

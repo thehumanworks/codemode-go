@@ -31,7 +31,12 @@
 // TypeScript a host can show to the model or serve as a resource.
 //
 // Schemas are accepted as any value that marshals to JSON Schema (a
-// map[string]any, a *jsonschema.Schema, a struct, raw JSON) and are decoded
-// once, when the Catalog is built. A Catalog is immutable and safe for
-// concurrent use.
+// map[string]any, a *jsonschema.Schema, a struct) or as raw JSON in a
+// json.RawMessage, []byte or string, and are decoded once, when the Catalog
+// is built; raw JSON that does not parse renders as unknown.
+//
+// A Catalog is immutable and safe for concurrent use. New decodes schemas
+// into values of its own and copies Extra; Entries, Lookup and Describe hand
+// out copies of Extra. The decoded schemas inside returned entries and
+// members are shared by reference and must not be mutated.
 package catalog

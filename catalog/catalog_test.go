@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -28,7 +29,7 @@ func testEntries(t *testing.T) []Entry {
 				"type":"object",
 				"properties":{
 					"block":{"type":"string","description":"Pane id to read"},
-					"lines":{"type":"integer","description":"Scrollback lines","minimum":1},
+					"lines":{"type":"integer","description":"History lines to include","minimum":1},
 					"mode":{"type":"string","enum":["screen","scrollback"]}
 				},
 				"required":["block"]
@@ -106,9 +107,14 @@ func TestCatalogSearch(t *testing.T) {
 	if got := c.Search("split", 0).Results; len(got) == 0 || got[0].Path != "api.session.new_split" {
 		t.Errorf("split: %+v", got)
 	}
-	// Enum values and property descriptions are searchable.
-	if got := c.Search("scrollback", 0).Results; len(got) == 0 || got[0].Path != "rex.capture" {
+	// Enum values are searchable: "scrollback" appears only in the enum of
+	// rex.capture's mode property.
+	if got := c.Search("scrollback", 0).Results; len(got) != 1 || got[0].Path != "rex.capture" {
 		t.Errorf("enum: %+v", got)
+	}
+	// So are property descriptions: "history" appears only in lines'.
+	if got := c.Search("history", 0).Results; len(got) != 1 || got[0].Path != "rex.capture" {
+		t.Errorf("property description: %+v", got)
 	}
 	if got := c.Search("rex_capture", 0).Results; len(got) == 0 || got[0].Path != "rex.capture" {
 		t.Errorf("keywords: %+v", got)
@@ -513,5 +519,211 @@ func TestFirstSentence(t *testing.T) {
 		if got := firstSentence(in); got != want {
 			t.Errorf("firstSentence(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// Entries, Lookup and Describe hand out copies: changing what they return,
+// or the Extra map given to New, does not change later results.
+func TestCatalogDoesNotExposeState(t *testing.T) {
+	extra := map[string]any{
+		"call":    "await rex.x()",
+		"example": map[string]any{"a": 1.0},
+		"list":    []any{"p", map[string]any{"q": "r"}},
+		"names":   []string{"n"},
+	}
+	c := New([]Entry{{Path: "rex.x", Description: "X.", Extra: extra}}, Options{Namespace: "rex"})
+	want, err := c.Describe("rex.x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantJSON, _ := json.Marshal(want)
+	check := func(step string) {
+		t.Helper()
+		got, err := c.Describe("rex.x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := json.Marshal(got); string(b) != string(wantJSON) {
+			t.Errorf("after %s:\n got %s\nwant %s", step, b, wantJSON)
+		}
+	}
+
+	extra["call"] = "changed"
+	extra["example"].(map[string]any)["a"] = 2.0
+	check("changing the Extra given to New")
+
+	es := c.Entries()
+	es[0].Path = "rex.y"
+	es[0].Extra["call"] = "changed"
+	es[0].Extra["example"].(map[string]any)["a"] = 3.0
+	es[0].Extra["list"].([]any)[1].(map[string]any)["q"] = "changed"
+	es[0].Extra["names"].([]string)[0] = "changed"
+	check("changing Entries()")
+	if c.Entries()[0].Path != "rex.x" {
+		t.Error("Entries() shares its slice")
+	}
+
+	e, _ := c.Lookup("rex.x")
+	e.Extra["call"] = "changed"
+	e.Extra["example"].(map[string]any)["a"] = 4.0
+	check("changing Lookup()")
+
+	out, _ := c.Describe("rex.x")
+	out["call"] = "changed"
+	out["example"].(map[string]any)["a"] = 5.0
+	out["list"].([]any)[0] = "changed"
+	out["names"].([]string)[0] = "changed"
+	check("changing Describe()")
+}
+
+// The namespace name, and "tools" when it is an alias for the namespace,
+// match every member, so search ignores them.
+func TestSearchIgnoresNamespaceWords(t *testing.T) {
+	c := testCatalog(t, Options{})
+	res := c.Search("rex session", 0)
+	var paths []string
+	for _, h := range res.Results {
+		paths = append(paths, h.Path)
+	}
+	if res.Total != 2 || !reflect.DeepEqual(paths, []string{"api.session.view", "api.session.new_split"}) {
+		t.Errorf("rex session: %v (total %d)", paths, res.Total)
+	}
+	if got := c.Search("rex tools", 0); got.Total != 0 || !strings.Contains(got.Hint, `describe("rex")`) {
+		t.Errorf("namespace words only: %+v", got)
+	}
+	if got := c.Search("rex_capture", 0).Results; len(got) != 1 || got[0].Path != "rex.capture" {
+		t.Errorf("rex_capture: %+v", got)
+	}
+	if got := New([]Entry{{Path: "tools.sum", Description: "Add numbers."}, {Path: "tools.ls", Description: "List files."}}, Options{}).Search("tools sum", 0); got.Total != 1 || got.Results[0].Path != "tools.sum" {
+		t.Errorf("tools namespace: %+v", got)
+	}
+
+	// When "tools" is a group rather than the namespace, it is a real word.
+	g := New([]Entry{
+		{Path: "rex.capture", Description: "Read a pane."},
+		{Path: "tools.list", Kind: "listing", Description: "List installed things."},
+	}, Options{Namespace: "rex"})
+	if got := g.Search("tools", 0); got.Total != 1 || got.Results[0].Path != "tools.list" {
+		t.Errorf("tools group: %+v", got)
+	}
+}
+
+func TestDescribeDidYouMean(t *testing.T) {
+	c := testCatalog(t, Options{})
+	for target, first := range map[string]string{
+		"rex.captur":       "rex.capture",
+		"captur":           "rex.capture",
+		"rex.Captur":       "rex.capture",
+		"rex.snd":          "rex.send",
+		"rex.cap":          "rex.capture",
+		"api.session.veiw": "api.session.view",
+		"api.session.new":  "api.session.new_split",
+	} {
+		_, err := c.Describe(target)
+		prefix := fmt.Sprintf("describe: %q not found. Did you mean: %s", target, first)
+		if err == nil || !strings.HasPrefix(err.Error(), prefix) {
+			t.Errorf("%s: got %v, want prefix %s", target, err, prefix)
+		}
+	}
+	// Close segments under the target's parent come before others.
+	p := New([]Entry{
+		{Path: "b.view"},
+		{Path: "a.view"},
+		{Path: "a.vew"},
+		{Path: "a.far"},
+	}, Options{Namespace: "x"})
+	if _, err := p.Describe("a.veiw"); err == nil || !strings.Contains(err.Error(), "Did you mean: a.view, a.vew, b.view?") {
+		t.Errorf("parent order: %v", err)
+	}
+	// The namespace word alone suggests nothing in particular.
+	if _, err := c.Describe("rex.zebra"); err == nil || strings.Contains(err.Error(), "Did you mean") {
+		t.Errorf("rex.zebra: %v", err)
+	}
+}
+
+// "tools" names the namespace only when nothing else claims it.
+func TestToolsAlias(t *testing.T) {
+	g := New([]Entry{
+		{Path: "rex.capture", Description: "Read a pane."},
+		{Path: "tools.list", Kind: "listing", Description: "List installed things."},
+		{Path: "tools.add", Kind: "listing", Description: "Install a thing."},
+	}, Options{Namespace: "rex"})
+	out, err := g.Describe("tools")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"tools.add: Install a thing.", "tools.list: List installed things."}
+	if out["path"] != "tools" || out["kind"] != "namespace" || out["types"] != nil || !reflect.DeepEqual(out["members"], want) {
+		t.Errorf("tools should be the group: %v", out)
+	}
+	if out, _ := g.Describe("rex"); out["path"] != "rex" || out["types"] == nil {
+		t.Errorf("rex: %v", out)
+	}
+	wantHint := `No match. Try other words, or describe("rex") to list every tool, describe("tools") for every listing.`
+	if h := g.Search("zebra", 0).Hint; h != wantHint {
+		t.Errorf("hint:\n got %s\nwant %s", h, wantHint)
+	}
+	if _, err := g.Describe("zebra"); err == nil || err.Error() != `describe: "zebra" not found. Use search("...") or describe("rex"), describe("tools").` {
+		t.Errorf("not found: %v", err)
+	}
+
+	// An entry at exactly "tools" also claims the name.
+	e := New([]Entry{{Path: "rex.capture"}, {Path: "tools", Kind: "doc", Description: "About tools."}}, Options{Namespace: "rex"})
+	if out, _ := e.Describe("tools"); out["path"] != "tools" || out["kind"] != "doc" {
+		t.Errorf("entry tools: %v", out)
+	}
+
+	// Otherwise, and always when the namespace is "tools", it is the namespace.
+	for _, c := range []*Catalog{
+		New([]Entry{{Path: "rex.capture"}, {Path: "api.x"}}, Options{Namespace: "rex"}),
+		New([]Entry{{Path: "tools.capture"}}, Options{}),
+	} {
+		out, err := c.Describe("tools")
+		if err != nil || out["kind"] != "namespace" || out["types"] == nil {
+			t.Errorf("alias: %v %v", out, err)
+		}
+	}
+}
+
+// Raw JSON schemas may come as json.RawMessage, []byte or string.
+func TestRawJSONSchemas(t *testing.T) {
+	const src = `{"type":"object","properties":{"x":{"type":"number"}}}`
+	c := New([]Entry{
+		{Path: "fs.raw", Input: json.RawMessage(src), Output: json.RawMessage(src)},
+		{Path: "fs.bytes", Input: []byte(src), Output: []byte(src)},
+		{Path: "fs.str", Input: src, Output: src},
+		{Path: "fs.bad", Input: "not json", Output: []byte("{")},
+		{Path: "fs.empty", Input: "", Output: []byte(" ")},
+	}, Options{Namespace: "fs"})
+	for _, name := range []string{"raw", "bytes", "str"} {
+		desc, err := c.Describe(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := name + "(args: {\n    x?: number;\n  }): Promise<{\n    x?: number;\n  }>;"
+		if types := desc["types"].(string); !strings.Contains(types, want) {
+			t.Errorf("%s: want %q in\n%s", name, want, types)
+		}
+		if e, _ := c.Lookup("fs." + name); !reflect.DeepEqual(e.Input, schema(t, src)) {
+			t.Errorf("%s: input %#v", name, e.Input)
+		}
+	}
+	if desc, _ := c.Describe("bad"); !strings.Contains(desc["types"].(string), "bad(args: unknown): Promise<unknown>;") || desc["call"] != "await fs.bad({...})" {
+		t.Errorf("bad: %v", desc)
+	}
+	if desc, _ := c.Describe("empty"); !strings.Contains(desc["types"].(string), "empty(): Promise<unknown>;") || desc["call"] != "await fs.empty()" {
+		t.Errorf("empty: %v", desc)
+	}
+}
+
+// Two member names that map to one identifier are declared once.
+func TestCatalogDeclarationDuplicateIdentifiers(t *testing.T) {
+	c := New([]Entry{
+		{Path: "ns.a-b", Description: "Dashed."},
+		{Path: "ns.a_b", Description: "Underscored."},
+	}, Options{Namespace: "ns"})
+	d := c.Declaration()
+	if strings.Count(d, "a_b(") != 1 || !strings.Contains(d, "Dashed.") || strings.Contains(d, "Underscored.") {
+		t.Errorf("declaration:\n%s", d)
 	}
 }
