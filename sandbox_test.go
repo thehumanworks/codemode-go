@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func testTools() []Tool {
@@ -274,6 +275,12 @@ func TestClip(t *testing.T) {
 	}
 	if o, c := Clip("short", 300); c || o != "short" {
 		t.Error("no clip expected")
+	}
+	// Multi-byte characters are never split, so the result marshals cleanly.
+	u := strings.Repeat("é", 400) + strings.Repeat("日", 400)
+	out, cut = Clip(u, 301)
+	if !cut || !utf8.ValidString(out) || !strings.HasPrefix(out, "éé") || !strings.HasSuffix(out, "日日") {
+		t.Errorf("utf8 clip: valid=%v %q", utf8.ValidString(out), out[:12])
 	}
 }
 

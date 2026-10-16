@@ -42,6 +42,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/fastschema/qjs"
 )
@@ -652,15 +653,22 @@ func identifier(name string) string {
 	return b.String()
 }
 
-// Clip shortens s to about max characters, keeping the head and the tail
-// around a marker that states how much was cut. It reports whether anything
-// was cut. Hosts use it on results before showing them to a model.
+// Clip shortens s to about max bytes, keeping the head and the tail around
+// a marker that states how much was cut, without splitting a UTF-8
+// character. It reports whether anything was cut. Hosts use it on results
+// before showing them to a model.
 func Clip(s string, max int) (string, bool) {
 	if max <= 0 || len(s) <= max {
 		return s, false
 	}
 	head := max * 2 / 3
-	tail := max - head
-	marker := "\n--- TRUNCATED: " + strconv.Itoa(len(s)-max) + " of " + strconv.Itoa(len(s)) + " characters omitted; return less from the script or filter in code ---\n"
-	return s[:head] + marker + s[len(s)-tail:], true
+	for head > 0 && !utf8.RuneStart(s[head]) {
+		head--
+	}
+	tail := len(s) - (max - head)
+	for tail < len(s) && !utf8.RuneStart(s[tail]) {
+		tail++
+	}
+	marker := "\n--- TRUNCATED: " + strconv.Itoa(tail-head) + " of " + strconv.Itoa(len(s)) + " characters omitted; return less from the script or filter in code ---\n"
+	return s[:head] + marker + s[tail:], true
 }

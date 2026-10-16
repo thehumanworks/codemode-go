@@ -194,6 +194,8 @@ type RunConfig struct {
     Context context.Context  // nil keeps the request context; tool calls run under it
     Entries []catalog.Entry  // extra catalogue entries for this run (API methods, ...)
     Args    func(tool string, args json.RawMessage) json.RawMessage // rewrite tool arguments; nil = unchanged
+    Warning string           // added to search/describe results (partial catalogue)
+    Cleanup func()           // called once the run has finished, whatever the outcome; not called when Prepare errors
 }
 
 type Options struct {
@@ -203,10 +205,10 @@ type Options struct {
     Mode           Mode              // default ModeOn
     Title          string            // code tool title; default "Run a script"
     Description    string            // code tool description; default generated (lists members, explains search/describe)
-    Params         map[string]*jsonschema.Schema // extra properties on the code tool's input, passed to Prepare
+    Params         map[string]*jsonschema.Schema // extra properties on the code tool's input, validated (no defaults) and passed to Prepare; New panics if one cannot be resolved
     Prepare        func(ctx context.Context, args map[string]any) (*RunConfig, error) // optional per-run hook
     Catalog        catalog.Options   // Namespace is overridden
-    Sandbox        codemode.Options  // Namespace and Hint are overridden; Timeout is the default per-call timeout
+    Sandbox        codemode.Options  // Namespace and Hint are overridden; Timeout is the default per-call timeout, clamped to MaxTimeout
     MaxTimeout     time.Duration     // cap for the "timeout" argument; default 10m
     MaxResultChars int               // result JSON shown to the model; default 24 KiB
     TypesURI       string            // when set, Register also serves the declarations as a resource at this URI
@@ -214,17 +216,24 @@ type Options struct {
 
 type Registry struct{ /* server, opts, recorded tools */ }
 func New(server *mcp.Server, opts Options) *Registry
-// AddTool records a typed tool and, unless Mode is only, registers it on the server
-// exactly as mcp.AddTool would. t.InputSchema (and OutputSchema when Out is not any)
-// are derived when nil, so the catalogue and the server share one schema.
+// AddTool records a copy of a typed tool and, unless Mode is only, registers it on
+// the server exactly as mcp.AddTool would. The copy's InputSchema (and OutputSchema
+// when Out is not any) are derived when nil, so the catalogue and the server share
+// one schema; the caller's struct is never written. In every mode it runs the SDK's
+// own checks first and panics with the SDK's message where mcp.AddTool would, and it
+// panics when the tool's name or member collides with another tool or the code tool.
 func AddTool[In, Out any](r *Registry, t *mcp.Tool, h mcp.ToolHandlerFor[In, Out])
-// AddTool is the untyped form, mirroring (*mcp.Server).AddTool.
+// AddTool is the untyped form, mirroring (*mcp.Server).AddTool: no validation, no
+// defaults, no panic on schemas the SDK accepts.
 func (r *Registry) AddTool(t *mcp.Tool, h mcp.ToolHandler)
-// Register adds the code tool (and the types resource); no-op in ModeOff.
-// Call it after every AddTool: the generated description lists the members.
+// Register adds the code tool (and the types resource); no-op in ModeOff. A tool
+// added after Register re-registers the code tool so its description stays current.
 func (r *Registry) Register()
-func (r *Registry) Tools() []*mcp.Tool
-func (r *Registry) Call(ctx context.Context, name string, args json.RawMessage) (json.RawMessage, error) // what a script call does
+func (r *Registry) Tools() []*mcp.Tool   // the registry's copies
+// Call does what a script call does. The name is matched as given first (so dotted
+// tool names work), then with "<ns>." stripped. The request carries no Session or
+// Extra unless ctx comes from a code-tool run.
+func (r *Registry) Call(ctx context.Context, name string, args json.RawMessage) (json.RawMessage, error)
 func (r *Registry) Catalog(extra ...catalog.Entry) *catalog.Catalog
 func (r *Registry) Declarations() string   // GlobalsDeclaration + namespace declaration
 func (r *Registry) Guidance() string       // paragraph for server instructions, mode-aware
@@ -232,21 +241,33 @@ func UnwrapResult(res *mcp.CallToolResult, err error) (json.RawMessage, error)
 ```
 
 Code tool input: `{code: string (required), timeout?: string}` plus `Params`.
-`timeout` accepts `30s`, `2m`, or a number of seconds; capped at MaxTimeout.
+`timeout` accepts `30s`, `2m`, or a number of seconds, clamped to
+[1ns, MaxTimeout]; `0`, `"0"` and `"0s"` mean the default; NaN and ±Inf are
+errors.
 
-Script tool calls: arguments are validated against the tool's resolved input
-schema (error "invalid arguments: ..."), defaults applied, unmarshalled into
-`In`, the handler called with a `*mcp.CallToolRequest` carrying the name and
-raw arguments, and the result shaped like the SDK does (nil result → empty;
-non-nil `Out` → StructuredContent and, when Content is empty, a JSON text
-block). `UnwrapResult` then turns it into the script's value: error → reject;
-`IsError` → reject with the text; `StructuredContent` → its JSON; one text
-block that parses as a JSON object or array → that JSON; else the text as a
-string, or the texts as a string array.
+Script tool calls behave exactly like the same call over the wire. Typed
+tools: arguments are validated against the resolved input schema (error
+"invalid arguments: ..."), defaults applied, decoded case-sensitively into
+`In`; the handler gets a `*mcp.CallToolRequest` with the name, the arguments
+as sent, and the code-tool request's `Session` and `Extra`; the result is
+shaped as the SDK's `applySchema` does (nil result → empty; typed-nil pointer
+`Out` → the element's zero value; `Out` replaces StructuredContent and adds a
+JSON text block when Content is empty or the output is not an object; `Out`
+skipped when InputRequests is set); the output is validated against the
+output schema with defaults ("validating tool output: ..."). Untyped tools
+get no validation and no defaults; empty, `null` or `undefined` arguments
+become `{}`. A handler panic rejects the call with `tool "X" panicked: ...`.
+`UnwrapResult` then turns the result into the script's value: error →
+reject; `IsError` → reject with the text; `StructuredContent` (JSON `null`
+counts as absent) → its JSON; one text block that parses as a JSON object or
+array → that JSON; else the text as a string, or the texts as a string
+array; content with no text blocks → the JSON of the content array.
 
 Result rendering (text content, plus structured content
 `{ok, result, calls, elapsed_ms, truncated}` or `{ok:false, error, calls, logs}`),
-`IsError` set on any failure:
+`IsError` set on any failure. Results over MaxResultChars are clipped in the
+text and `result` becomes the clipped text as a string; error text is clipped
+too:
 
 ```
 Script completed in 1.2s with 3 tool call(s).
@@ -263,12 +284,16 @@ Error: boom
     at <anonymous> (script.js:3)
 ```
 ```
-Script timed out after 1s with 2 tool call(s) started. Pass a longer timeout (max 10m), or split the work across scripts.
+Script timed out after 1.003s (limit 1s) with 2 tool call(s) started. Pass a longer timeout (max 10m), or split the work across scripts.
+```
+```
+Script timed out after 302ms with 1 tool call(s) started: the request's deadline passed before the script's 1m0s timeout. A longer timeout will not help; split the work across scripts.
 ```
 
 Modes: `on` → AddTool registers on the server and records, Register adds the
 code tool. `only` → AddTool records only, Register adds the code tool. `off`
-→ AddTool registers on the server, Register does nothing.
+→ AddTool registers on the server, Register does nothing. A tool is valid or
+invalid the same way in every mode.
 
 ## Testing
 

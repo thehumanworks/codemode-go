@@ -149,17 +149,21 @@ reg := mcptool.New(srv, mcptool.Options{
 
 mcptool.AddTool(reg, &mcp.Tool{Name: "notes_add", Description: "Store a note."}, addHandler)
 mcptool.AddTool(reg, &mcp.Tool{Name: "notes_list", Description: "List note titles."}, listHandler)
-reg.Register() // adds the "code" tool; call it after every AddTool
+reg.Register() // adds the "code" tool (tools added later re-register it)
 go codemode.Warm()
 ```
 
 `AddTool` has the same signature as `mcp.AddTool`, derives the input schema
-from the handler's input type when the tool gives none, and registers the tool
-on the server exactly as the SDK would. When a script calls a tool, the
-arguments are validated against that schema and defaults applied, so the
-script sees what a client over the wire would see. Results are unwrapped the
-way Cloudflare's codemode does: structured content wins, a JSON text block
-becomes its value, other text becomes a string, `isError` rejects.
+from the handler's input type when the tool gives none, and registers a copy
+of the tool on the server exactly as the SDK would. A script call behaves
+like the same call over the wire: arguments are validated and defaulted,
+output is validated, the handler sees the code tool's session, and a panic
+in a handler rejects the call instead of ending the process. A parity test
+compares every case through a real client. Name collisions (two tools that
+would become the same member, or a tool named like the code tool) panic at
+registration. Results are unwrapped the way Cloudflare's codemode does:
+structured content wins, a JSON text block becomes its value, other text
+becomes a string, `isError` rejects.
 
 The model gets a `code` tool with `code` and `timeout` arguments, a generated
 description that lists the members and explains `search` and `describe`, and
@@ -176,9 +180,11 @@ titles: groceries, ideas, todo
 ```
 
 Failures say `Script failed after 40ms with 1 tool call(s):` followed by the
-JavaScript error and stack, or `Script timed out after 1m0s ...`. Structured
-content carries `{ok, result, calls, elapsed_ms, truncated, logs}` for clients
-that read it.
+JavaScript error and stack, or `Script timed out after 1m0.01s (limit 1m0s)
+...` (a timeout caused by the request's own deadline says so instead of
+suggesting a longer `timeout`). Results and errors are clipped to
+`MaxResultChars` in both the text and the structured content, which carries
+`{ok, result, calls, elapsed_ms, truncated, logs}` for clients that read it.
 
 Modes:
 
@@ -194,7 +200,9 @@ tells the model when to prefer the code tool.
 Hosts with dynamic catalogues (methods discovered at runtime, per-call
 settings) use `Options.Params` to add properties to the code tool's input and
 `Options.Prepare` to turn them into a `RunConfig`: a context for the tool
-calls, extra catalogue entries, a warning, and an argument rewriter.
+calls, extra catalogue entries, a warning, an argument rewriter and a cleanup
+hook. `Params` values are validated against their schemas before `Prepare`
+runs.
 [rex-mcp-server](https://github.com/thehumanworks/rex-mcp-server) does this to
 expose a terminal multiplexer's whole API through one tool.
 
