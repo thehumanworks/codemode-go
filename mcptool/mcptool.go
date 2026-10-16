@@ -11,13 +11,23 @@
 //	reg := mcptool.New(srv, mcptool.Options{Namespace: "files", Mode: mcptool.ModeOn})
 //	mcptool.AddTool(reg, &mcp.Tool{Name: "read", Description: "Read a file"}, readHandler)
 //	mcptool.AddTool(reg, &mcp.Tool{Name: "list", Description: "List a directory"}, listHandler)
-//	reg.Register() // adds the "code" tool; call it after every AddTool
+//	reg.Register() // adds the "code" tool; tools added later refresh it
 //
 // A model then calls the code tool with:
 //
 //	const names = (await files.list({dir: "."})).entries;
 //	const texts = await Promise.all(names.map(n => files.read({path: n})));
 //	return texts.map(t => t.length);
+//
+// A tool called from a script behaves as the same tool called by a client:
+// typed tools (AddTool) get the SDK's input validation and defaults, its
+// case-sensitive decoding of In, and its output validation and result
+// shaping; untyped tools ((*Registry).AddTool) get the arguments as sent,
+// with no validation. The handler's request carries the Session and Extra
+// of the code tool's request. The differences: argument errors read
+// "invalid arguments: ..." rather than the SDK's "validating \"arguments\"",
+// and a handler that panics rejects the script's call with an error instead
+// of crashing the process.
 package mcptool
 
 import (
@@ -25,6 +35,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -77,6 +88,10 @@ type RunConfig struct {
 	// Args rewrites a tool's arguments before the call, for example to
 	// inject a default the script did not give. nil leaves them unchanged.
 	Args func(tool string, args json.RawMessage) json.RawMessage
+	// Cleanup, when set, is called once the script run has finished,
+	// whatever its outcome, for example to cancel a Context derived with
+	// context.WithTimeout. It is not called when Prepare returns an error.
+	Cleanup func()
 }
 
 // Options configure a Registry. The zero value is usable.
@@ -98,7 +113,9 @@ type Options struct {
 	// Annotations for the code tool, if any.
 	Annotations *mcp.ToolAnnotations
 	// Params are extra properties on the code tool's input, beside code and
-	// timeout. Their values reach Prepare.
+	// timeout. A value given for one is validated against its schema
+	// ("invalid arguments: ..." otherwise) and then reaches Prepare. New
+	// panics when one of the schemas cannot be resolved.
 	Params map[string]*jsonschema.Schema
 	// Prepare runs before each script with the tool's arguments. It can
 	// derive a context, add catalogue entries, and rewrite tool arguments.
@@ -106,7 +123,7 @@ type Options struct {
 	// Catalog options; Namespace is overridden.
 	Catalog catalog.Options
 	// Sandbox options; Namespace and Hint are overridden, Timeout is the
-	// default when the call gives none.
+	// default when the call gives none (at most MaxTimeout).
 	Sandbox codemode.Options
 	// MaxTimeout caps the timeout argument. Default 10 minutes.
 	MaxTimeout time.Duration
@@ -139,190 +156,183 @@ func (o Options) withDefaults() Options {
 	if o.Sandbox.Timeout <= 0 {
 		o.Sandbox.Timeout = 60 * time.Second
 	}
+	if o.Sandbox.Timeout > o.MaxTimeout {
+		o.Sandbox.Timeout = o.MaxTimeout
+	}
 	return o
 }
 
 // entry is one recorded tool.
 type entry struct {
-	tool     *mcp.Tool
-	member   string
-	resolved *jsonschema.Resolved
-	call     func(ctx context.Context, args json.RawMessage) (*mcp.CallToolResult, error)
+	tool   *mcp.Tool // the registry's copy
+	member string
+	call   func(ctx context.Context, args json.RawMessage) (*mcp.CallToolResult, error)
 }
 
 // Registry records tools for scripts and forwards them to the server.
 type Registry struct {
 	server *mcp.Server
 	opts   Options
+	params map[string]*jsonschema.Resolved
 
-	mu    sync.RWMutex
-	tools []*entry
+	mu         sync.RWMutex
+	tools      []*entry
+	registered bool // Register has run; later tools refresh the code tool
+
+	codeMu sync.Mutex // serialises registrations of the code tool
 }
 
-// New creates a Registry for server.
+// New creates a Registry for server. It panics when a schema in
+// opts.Params cannot be resolved.
 func New(server *mcp.Server, opts Options) *Registry {
-	return &Registry{server: server, opts: opts.withDefaults()}
+	r := &Registry{server: server, opts: opts.withDefaults()}
+	for name, s := range r.opts.Params {
+		if s == nil || name == "code" || name == "timeout" {
+			continue
+		}
+		resolved, err := s.Resolve(nil)
+		if err != nil {
+			panic(fmt.Sprintf("mcptool: param %q: %v", name, err))
+		}
+		if r.params == nil {
+			r.params = map[string]*jsonschema.Resolved{}
+		}
+		r.params[name] = resolved
+	}
+	return r
 }
 
 // Mode reports the effective mode.
 func (r *Registry) Mode() Mode { return r.opts.Mode }
 
 // AddTool records a typed tool and, unless the mode is only, registers it on
-// the server exactly as mcp.AddTool would. When t.InputSchema is nil it is
-// derived from In (and OutputSchema from Out when Out is not any), so the
-// server and the catalogue share one schema. It panics on an invalid schema,
-// like mcp.AddTool.
+// the server exactly as mcp.AddTool would. Like mcp.AddTool it works on a
+// copy of t: when the copy's InputSchema is nil it is derived from In (and
+// OutputSchema from Out when Out is not any), so the server and the
+// catalogue share one schema; t itself is not modified. Scripts get what a
+// client gets: input validated with defaults applied, In decoded with
+// case-sensitive field names, output validated against the output schema
+// with defaults applied, and the result shaped the same way.
+//
+// It panics, in every mode and before recording anything, where mcp.AddTool
+// would (for example when the input schema is not an object schema), and
+// when the tool's name or member name collides with another tool's or with
+// the code tool's name.
 func AddTool[In, Out any](r *Registry, t *mcp.Tool, h mcp.ToolHandlerFor[In, Out]) {
-	if t.InputSchema == nil {
-		if reflect.TypeFor[In]() == reflect.TypeFor[any]() {
-			t.InputSchema = &jsonschema.Schema{Type: "object"}
-		} else {
-			t.InputSchema = mustSchema(t.Name, "input", reflect.TypeFor[In]())
+	tt := *t
+	if reflect.TypeFor[In]() == reflect.TypeFor[any]() && tt.InputSchema == nil {
+		tt.InputSchema = &jsonschema.Schema{Type: "object"}
+	}
+	inResolved, _, err := setSchema[In](&tt.InputSchema)
+	if err != nil {
+		panic(fmt.Sprintf("AddTool: tool %q: input schema: %v", t.Name, err))
+	}
+	var (
+		outResolved *jsonschema.Resolved
+		elemZero    any
+	)
+	if tt.OutputSchema != nil || reflect.TypeFor[Out]() != reflect.TypeFor[any]() {
+		if outResolved, elemZero, err = setSchema[Out](&tt.OutputSchema); err != nil {
+			panic(fmt.Sprintf("AddTool: tool %q: output schema: %v", t.Name, err))
 		}
 	}
-	if t.OutputSchema == nil && reflect.TypeFor[Out]() != reflect.TypeFor[any]() {
-		t.OutputSchema = mustSchema(t.Name, "output", reflect.TypeFor[Out]())
-	}
-	resolved := mustResolve(t.Name, t.InputSchema)
-	isPointer := reflect.TypeFor[Out]().Kind() == reflect.Pointer
-	call := func(ctx context.Context, args json.RawMessage) (*mcp.CallToolResult, error) {
-		args, err := validateArgs(args, resolved)
+	sdkCheck(func(s *mcp.Server) { mcp.AddTool(s, &tt, h) })
+	call := func(ctx context.Context, args json.RawMessage) (res *mcp.CallToolResult, err error) {
+		defer recoverCall(tt.Name, &res, &err)
+		args = objectArgs(args)
+		input, err := applySchema(args, inResolved, false)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("invalid arguments: %v", err)
 		}
 		var in In
-		if err := json.Unmarshal(args, &in); err != nil {
+		if err := decodeInput(input, &in); err != nil {
 			return nil, fmt.Errorf("invalid arguments: %w", err)
 		}
-		res, out, err := h(ctx, &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Name: t.Name, Arguments: args}}, in)
+		res, out, err := h(ctx, toolRequest(ctx, tt.Name, args), in)
 		if err != nil {
 			return nil, err
 		}
-		if res == nil {
-			res = &mcp.CallToolResult{}
-		}
-		var outval any = out
-		if isPointer && reflect.ValueOf(out).IsNil() {
-			outval = nil
-		}
-		if outval != nil && res.StructuredContent == nil {
-			b, err := json.Marshal(outval)
-			if err != nil {
-				return nil, fmt.Errorf("marshaling output: %w", err)
-			}
-			res.StructuredContent = json.RawMessage(b)
-			if res.Content == nil {
-				res.Content = []mcp.Content{&mcp.TextContent{Text: string(b)}}
-			}
-		}
-		return res, nil
+		return shapeResult(res, out, elemZero, outResolved)
 	}
-	r.add(t, resolved, call)
-	if r.opts.Mode != ModeOnly {
-		mcp.AddTool(r.server, t, h)
-	}
+	r.add(&tt, call, func() { mcp.AddTool(r.server, &tt, h) })
 }
 
 // AddTool records an untyped tool and, unless the mode is only, registers it
-// on the server as (*mcp.Server).AddTool would. Arguments from scripts are
-// validated when t.InputSchema is a *jsonschema.Schema.
+// on the server as (*mcp.Server).AddTool would, using a copy of t. As over
+// the wire, the handler gets the arguments as the script sent them (an
+// empty object when none) with no validation and no defaults, and its
+// result is used as is. It panics where (*mcp.Server).AddTool would, in
+// every mode, and on name collisions like AddTool.
 func (r *Registry) AddTool(t *mcp.Tool, h mcp.ToolHandler) {
-	var resolved *jsonschema.Resolved
-	if sc, ok := t.InputSchema.(*jsonschema.Schema); ok {
-		resolved = mustResolve(t.Name, sc)
+	tt := *t
+	sdkCheck(func(s *mcp.Server) { s.AddTool(&tt, h) })
+	call := func(ctx context.Context, args json.RawMessage) (res *mcp.CallToolResult, err error) {
+		defer recoverCall(tt.Name, &res, &err)
+		return h(ctx, toolRequest(ctx, tt.Name, objectArgs(args)))
 	}
-	call := func(ctx context.Context, args json.RawMessage) (*mcp.CallToolResult, error) {
-		args, err := validateArgs(args, resolved)
-		if err != nil {
-			return nil, err
-		}
-		return h(ctx, &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Name: t.Name, Arguments: args}})
-	}
-	r.add(t, resolved, call)
-	if r.opts.Mode != ModeOnly {
-		r.server.AddTool(t, h)
-	}
+	r.add(&tt, call, func() { r.server.AddTool(&tt, h) })
 }
 
-func (r *Registry) add(t *mcp.Tool, resolved *jsonschema.Resolved, call func(context.Context, json.RawMessage) (*mcp.CallToolResult, error)) {
+// add records a checked tool and, unless the mode is only, registers it on
+// the server. When Register has already run, the code tool is registered
+// again so its description lists the new member.
+func (r *Registry) add(t *mcp.Tool, call func(context.Context, json.RawMessage) (*mcp.CallToolResult, error), register func()) {
 	member := t.Name
 	if r.opts.StripPrefix != "" {
 		member = strings.TrimPrefix(member, r.opts.StripPrefix)
 	}
 	member = catalog.Identifier(member)
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	refresh := func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if err := r.collision(t.Name, member); err != "" {
+			panic("mcptool: " + err)
+		}
+		if r.opts.Mode != ModeOnly {
+			register()
+		}
+		r.tools = append(r.tools, &entry{tool: t, member: member, call: call})
+		return r.registered
+	}()
+	if refresh {
+		r.registerCode()
+	}
+}
+
+// collision describes why a tool cannot be added, or returns "". Scripts
+// reach a tool by its name and by its member name, so neither may equal
+// another tool's name or member, nor the code tool's name.
+func (r *Registry) collision(name, member string) string {
+	if name == r.opts.Name || member == r.opts.Name {
+		return fmt.Sprintf("tool %q (member %q) collides with the code tool %q", name, member, r.opts.Name)
+	}
 	for _, e := range r.tools {
-		if e.tool.Name == t.Name {
-			panic(fmt.Sprintf("mcptool: tool %q added twice", t.Name))
+		if e.tool.Name == name {
+			return fmt.Sprintf("tool %q added twice", name)
+		}
+		if e.member == member || e.member == name || e.tool.Name == member {
+			return fmt.Sprintf("tool %q (member %q) collides with tool %q (member %q)", name, member, e.tool.Name, e.member)
 		}
 	}
-	r.tools = append(r.tools, &entry{tool: t, member: member, resolved: resolved, call: call})
+	return ""
 }
 
-func mustSchema(tool, which string, rt reflect.Type) *jsonschema.Schema {
-	if rt.Kind() == reflect.Pointer {
-		rt = rt.Elem()
-	}
-	s, err := jsonschema.ForType(rt, &jsonschema.ForOptions{})
-	if err != nil {
-		panic(fmt.Sprintf("mcptool: tool %q: %s schema: %v", tool, which, err))
-	}
-	return s
-}
-
-func mustResolve(tool string, schema any) *jsonschema.Resolved {
-	var sc *jsonschema.Schema
-	switch v := schema.(type) {
-	case *jsonschema.Schema:
-		sc = v
-	default:
-		b, err := json.Marshal(v)
-		if err == nil {
-			err = json.Unmarshal(b, &sc)
+// validateParams checks the values given for Options.Params.
+func (r *Registry) validateParams(args map[string]any) error {
+	for name, resolved := range r.params {
+		v, ok := args[name]
+		if !ok {
+			continue
 		}
-		if err != nil {
-			panic(fmt.Sprintf("mcptool: tool %q: input schema: %v", tool, err))
+		if err := resolved.Validate(&v); err != nil {
+			return fmt.Errorf("invalid arguments: %s: %v", name, err)
 		}
 	}
-	resolved, err := sc.Resolve(&jsonschema.ResolveOptions{ValidateDefaults: true})
-	if err != nil {
-		panic(fmt.Sprintf("mcptool: tool %q: input schema: %v", tool, err))
-	}
-	return resolved
+	return nil
 }
 
-// validateArgs checks a script's arguments against the schema and applies
-// defaults, as the SDK does for calls over the wire.
-func validateArgs(args json.RawMessage, resolved *jsonschema.Resolved) (json.RawMessage, error) {
-	s := strings.TrimSpace(string(args))
-	if s == "" || s == "null" || s == "undefined" {
-		args = json.RawMessage("{}")
-	}
-	if resolved == nil {
-		return args, nil
-	}
-	var inst any = map[string]any{}
-	if err := json.Unmarshal(args, &inst); err != nil {
-		return nil, fmt.Errorf("invalid arguments: must be a JSON object: %w", err)
-	}
-	if _, ok := inst.(map[string]any); !ok {
-		return nil, errors.New("invalid arguments: must be an object with the tool's properties")
-	}
-	if err := resolved.ApplyDefaults(&inst); err != nil {
-		return nil, fmt.Errorf("invalid arguments: %v", err)
-	}
-	if err := resolved.Validate(&inst); err != nil {
-		return nil, fmt.Errorf("invalid arguments: %v", err)
-	}
-	b, err := json.Marshal(inst)
-	if err != nil {
-		return nil, err
-	}
-	return b, nil
-}
-
-// Tools returns the recorded tools in registration order.
+// Tools returns the recorded tools in registration order. They are the
+// registry's copies and must not be modified.
 func (r *Registry) Tools() []*mcp.Tool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -333,31 +343,57 @@ func (r *Registry) Tools() []*mcp.Tool {
 	return out
 }
 
+// find resolves what a caller may name a tool: its full name, its member
+// name, or <namespace>.<member>. The name as given is tried first, so a
+// full name that contains a dot ("gh.search") is found.
 func (r *Registry) find(name string) *entry {
-	name = strings.TrimPrefix(name, r.opts.Namespace+".")
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	for _, e := range r.tools {
-		if e.tool.Name == name || e.member == name {
-			return e
+	match := func(name string) *entry {
+		for _, e := range r.tools {
+			if e.tool.Name == name || e.member == name {
+				return e
+			}
 		}
+		return nil
+	}
+	if e := match(name); e != nil {
+		return e
+	}
+	if rest, ok := strings.CutPrefix(name, r.opts.Namespace+"."); ok {
+		return match(rest)
 	}
 	return nil
 }
 
+// findByName finds a tool by its full name, also written as
+// <namespace>.<full name>.
 func (r *Registry) findByName(name string) *entry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	for _, e := range r.tools {
-		if e.tool.Name == name {
-			return e
+	match := func(name string) *entry {
+		for _, e := range r.tools {
+			if e.tool.Name == name {
+				return e
+			}
 		}
+		return nil
+	}
+	if e := match(name); e != nil {
+		return e
+	}
+	if rest, ok := strings.CutPrefix(name, r.opts.Namespace+"."); ok {
+		return match(rest)
 	}
 	return nil
 }
 
 // Call invokes a recorded tool the way a script does: by full name, member
-// name, or <namespace>.<member>; arguments validated; result unwrapped.
+// name, or <namespace>.<member>; the result unwrapped as a script receives
+// it. The request passed to the handler carries no Session or Extra unless
+// ctx comes from a run of the code tool, so a handler called through Call
+// must cope with a nil req.Session. A handler that panics makes Call return
+// an error.
 func (r *Registry) Call(ctx context.Context, name string, args json.RawMessage) (json.RawMessage, error) {
 	e := r.find(name)
 	if e == nil {
@@ -419,9 +455,11 @@ func (r *Registry) Declarations() string {
 func (r *Registry) Guidance() string {
 	ns, name := r.opts.Namespace, r.opts.Name
 	first := "<tool>"
-	if tools := r.Tools(); len(tools) > 0 {
-		first = r.find(tools[0].Name).member
+	r.mu.RLock()
+	if len(r.tools) > 0 {
+		first = r.tools[0].member
 	}
+	r.mu.RUnlock()
 	switch r.opts.Mode {
 	case ModeOn:
 		return fmt.Sprintf("`%s` runs JavaScript that calls these same tools as `%s.<name>(args)` (for example `%s.%s`) with `await`, and discovers more with `await search(\"...\")` and `await describe(\"%s.%s\")`. Prefer it when a task needs several calls: inspect then act, loop over items, wait and verify. Single actions can use the tools directly.", name, ns, ns, first, ns, first)
@@ -467,19 +505,17 @@ func (r *Registry) inputSchema() *jsonschema.Schema {
 }
 
 // Register adds the code tool, and the types resource when TypesURI is set.
-// It does nothing in ModeOff. Call it after every AddTool, since the
-// generated description lists the members.
+// It does nothing in ModeOff. A tool added after Register registers the
+// code tool again (the server replaces it and notifies clients), so the
+// generated description always lists every member.
 func (r *Registry) Register() {
 	if r.opts.Mode == ModeOff {
 		return
 	}
-	r.server.AddTool(&mcp.Tool{
-		Name:        r.opts.Name,
-		Title:       r.opts.Title,
-		Description: r.description(),
-		InputSchema: r.inputSchema(),
-		Annotations: r.opts.Annotations,
-	}, r.handle)
+	r.mu.Lock()
+	r.registered = true
+	r.mu.Unlock()
+	r.registerCode()
 	if r.opts.TypesURI != "" {
 		r.server.AddResource(&mcp.Resource{
 			URI:         r.opts.TypesURI,
@@ -491,6 +527,19 @@ func (r *Registry) Register() {
 			return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, MIMEType: "text/x.typescript", Text: r.Declarations()}}}, nil
 		})
 	}
+}
+
+// registerCode adds or replaces the code tool on the server.
+func (r *Registry) registerCode() {
+	r.codeMu.Lock()
+	defer r.codeMu.Unlock()
+	r.server.AddTool(&mcp.Tool{
+		Name:        r.opts.Name,
+		Title:       r.opts.Title,
+		Description: r.description(),
+		InputSchema: r.inputSchema(),
+		Annotations: r.opts.Annotations,
+	}, r.handle)
 }
 
 func errResult(msg string) *mcp.CallToolResult {
@@ -505,16 +554,19 @@ func (r *Registry) handle(ctx context.Context, req *mcp.CallToolRequest) (*mcp.C
 			return errResult("arguments must be a JSON object"), nil
 		}
 	}
+	if args == nil { // "null"
+		args = map[string]any{}
+	}
 	code, _ := args["code"].(string)
 	if strings.TrimSpace(code) == "" {
 		return errResult("code is required: the body of an async function, for example `return await " + r.opts.Namespace + "." + "<tool>({...})`"), nil
 	}
-	wait, err := parseTimeout(args["timeout"], r.opts.Sandbox.Timeout)
+	wait, err := parseTimeout(args["timeout"], r.opts.Sandbox.Timeout, r.opts.MaxTimeout)
 	if err != nil {
 		return errResult(err.Error()), nil
 	}
-	if wait > r.opts.MaxTimeout {
-		wait = r.opts.MaxTimeout
+	if err := r.validateParams(args); err != nil {
+		return errResult(err.Error()), nil
 	}
 	cfg := &RunConfig{}
 	if r.opts.Prepare != nil {
@@ -526,10 +578,15 @@ func (r *Registry) handle(ctx context.Context, req *mcp.CallToolRequest) (*mcp.C
 			cfg = c
 		}
 	}
+	if cfg.Cleanup != nil {
+		defer cfg.Cleanup()
+	}
 	runCtx := ctx
 	if cfg.Context != nil {
 		runCtx = cfg.Context
 	}
+	// Tool calls made by the script carry this request's Session and Extra.
+	runCtx = context.WithValue(runCtx, requestKey{}, req)
 	cat := r.catalogWith(cfg.Warning, cfg.Entries)
 	sopts := r.opts.Sandbox
 	sopts.Namespace = r.opts.Namespace
@@ -540,7 +597,8 @@ func (r *Registry) handle(ctx context.Context, req *mcp.CallToolRequest) (*mcp.C
 }
 
 // globals returns the catalogue's search and describe, with describe also
-// accepting a tool's full name (rex_capture) for its member path.
+// accepting a tool's full name (rex_capture, or tools.rex_capture) for its
+// member path.
 func (r *Registry) globals(cat *catalog.Catalog) map[string]codemode.HostFunc {
 	g := cat.Globals()
 	describe := g["describe"]
@@ -549,10 +607,10 @@ func (r *Registry) globals(cat *catalog.Catalog) map[string]codemode.HostFunc {
 		if json.Unmarshal(args, &pos) == nil && len(pos) > 0 {
 			var target string
 			if json.Unmarshal(pos[0], &target) == nil {
-				// Only full names are mapped here; member names and
-				// paths are the catalogue's business, so a member that
-				// shares its name with a group (api vs api.*) still lists
-				// the group.
+				// Only full names (alone or after the namespace) are
+				// mapped here; member names and paths are the
+				// catalogue's business, so a member that shares its name
+				// with a group (api vs api.*) still lists the group.
 				if e := r.findByName(strings.TrimSpace(target)); e != nil && e.tool.Name != e.member {
 					path, _ := json.Marshal(r.opts.Namespace + "." + e.member)
 					pos[0] = path
@@ -581,35 +639,50 @@ func (r *Registry) sandboxTools(rewrite func(string, json.RawMessage) json.RawMe
 	return tools
 }
 
-// parseTimeout accepts "30s", "2m", a number of seconds, or nothing.
-func parseTimeout(v any, def time.Duration) (time.Duration, error) {
+// parseTimeout accepts "30s", "2m", a number of seconds, or nothing, and
+// returns a duration in [1ns, limit]. Nothing, zero, and negative numbers
+// mean def; NaN, infinities, negative durations and other values are errors.
+func parseTimeout(v any, def, limit time.Duration) (time.Duration, error) {
+	invalid := func() error {
+		return fmt.Errorf("invalid timeout %v: use forms like 30s, 2m, or a number of seconds", v)
+	}
+	var secs float64
 	switch t := v.(type) {
 	case nil:
 		return def, nil
 	case float64:
-		if t <= 0 {
-			return def, nil
-		}
-		return time.Duration(t * float64(time.Second)), nil
+		secs = t
 	case string:
 		t = strings.TrimSpace(t)
 		if t == "" {
 			return def, nil
 		}
-		if n, err := strconv.ParseFloat(t, 64); err == nil {
-			if n <= 0 {
+		n, err := strconv.ParseFloat(t, 64)
+		if err != nil {
+			d, err := time.ParseDuration(t)
+			if err != nil || d < 0 {
+				return 0, fmt.Errorf("invalid timeout %q: use forms like 30s, 2m, or a number of seconds", t)
+			}
+			if d == 0 {
 				return def, nil
 			}
-			return time.Duration(n * float64(time.Second)), nil
+			return min(d, limit), nil
 		}
-		d, err := time.ParseDuration(t)
-		if err != nil || d <= 0 {
-			return 0, fmt.Errorf("invalid timeout %q: use forms like 30s, 2m, or a number of seconds", t)
-		}
-		return d, nil
+		secs = n
 	default:
-		return 0, fmt.Errorf("invalid timeout %v: use forms like 30s, 2m, or a number of seconds", v)
+		return 0, invalid()
 	}
+	if math.IsNaN(secs) || math.IsInf(secs, 0) {
+		return 0, invalid()
+	}
+	if secs <= 0 {
+		return def, nil
+	}
+	ns := secs * float64(time.Second)
+	if ns >= float64(limit) {
+		return limit, nil
+	}
+	return max(time.Duration(ns), time.Nanosecond), nil
 }
 
 // render turns a run into the tool result: a text report for the model and
@@ -630,29 +703,42 @@ func (r *Registry) render(out codemode.Output, err error, wait time.Duration) *m
 			b.WriteString("The script returned nothing. Return a value to report results.\n")
 		}
 		structured["ok"] = true
-		structured["result"] = out.Result
+		if truncated {
+			structured["result"] = text // the clipped JSON, as a string
+		} else {
+			structured["result"] = out.Result
+		}
 		structured["calls"] = out.Calls
 		structured["elapsed_ms"] = out.Elapsed.Milliseconds()
 		structured["truncated"] = truncated
 		logs = out.Logs
 	case errors.As(err, &scriptErr):
-		fmt.Fprintf(&b, "Script failed after %s with %d tool call(s):\n%s\n", scriptErr.Elapsed.Round(time.Millisecond), scriptErr.Calls, scriptErr.Message)
+		msg, _ := codemode.Clip(scriptErr.Message, r.opts.MaxResultChars)
+		fmt.Fprintf(&b, "Script failed after %s with %d tool call(s):\n%s\n", scriptErr.Elapsed.Round(time.Millisecond), scriptErr.Calls, msg)
 		structured["ok"] = false
-		structured["error"] = scriptErr.Message
+		structured["error"] = msg
 		structured["calls"] = scriptErr.Calls
 		structured["elapsed_ms"] = scriptErr.Elapsed.Milliseconds()
 		logs = scriptErr.Logs
 	case errors.As(err, &timeoutErr):
-		fmt.Fprintf(&b, "Script timed out after %s with %d tool call(s) started. Pass a longer timeout (max %s), or split the work across scripts.\n", wait, timeoutErr.Calls, r.opts.MaxTimeout)
+		took := timeoutErr.Elapsed.Round(time.Millisecond)
+		if timeoutErr.Timeout >= wait {
+			// The script's own timeout fired.
+			fmt.Fprintf(&b, "Script timed out after %s (limit %s) with %d tool call(s) started. Pass a longer timeout (max %s), or split the work across scripts.\n", took, wait, timeoutErr.Calls, r.opts.MaxTimeout)
+		} else {
+			// The request's context had an earlier deadline.
+			fmt.Fprintf(&b, "Script timed out after %s with %d tool call(s) started: the request's deadline passed before the script's %s timeout. A longer timeout will not help; split the work across scripts.\n", took, timeoutErr.Calls, wait)
+		}
 		structured["ok"] = false
 		structured["error"] = "timeout"
 		structured["calls"] = timeoutErr.Calls
 		structured["elapsed_ms"] = timeoutErr.Elapsed.Milliseconds()
 		logs = timeoutErr.Logs
 	default:
-		fmt.Fprintf(&b, "Sandbox error: %v\n", err)
+		msg, _ := codemode.Clip(err.Error(), r.opts.MaxResultChars)
+		fmt.Fprintf(&b, "Sandbox error: %s\n", msg)
 		structured["ok"] = false
-		structured["error"] = err.Error()
+		structured["error"] = msg
 	}
 	if len(logs) > 0 {
 		b.WriteString("<console_output>\n" + strings.Join(logs, "\n") + "\n</console_output>\n")
@@ -667,9 +753,11 @@ func (r *Registry) render(out codemode.Output, err error, wait time.Duration) *m
 
 // UnwrapResult turns a tool result into the value a script receives, the
 // way Cloudflare's codemode does: an error or IsError rejects with the
-// message, structured content wins, a single text that parses as a JSON
-// object or array becomes that value, a single other text becomes a string,
-// and several texts become a string array.
+// message, structured content wins (a JSON null counts as none, as it does
+// once sent over the wire), a single text that parses as a JSON object or
+// array becomes that value, a single other text becomes a string, several
+// texts become a string array, and content without text (images, audio,
+// resources) becomes the JSON of the content array.
 func UnwrapResult(res *mcp.CallToolResult, err error) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
@@ -691,10 +779,16 @@ func UnwrapResult(res *mcp.CallToolResult, err error) (json.RawMessage, error) {
 		return nil, errors.New(msg)
 	}
 	if res.StructuredContent != nil {
-		return json.Marshal(res.StructuredContent)
+		b, err := json.Marshal(res.StructuredContent)
+		if err != nil || string(b) != "null" {
+			return b, err
+		}
 	}
 	switch len(texts) {
 	case 0:
+		if len(res.Content) > 0 {
+			return json.Marshal(res.Content)
+		}
 		return json.RawMessage("null"), nil
 	case 1:
 		t := strings.TrimSpace(texts[0])

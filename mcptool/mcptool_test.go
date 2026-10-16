@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,7 +74,12 @@ func newServer(t *testing.T, opts Options) (*Registry, *mcp.ClientSession) {
 	})
 
 	reg.Register()
+	return reg, connect(t, srv)
+}
 
+// connect attaches an in-memory client to srv.
+func connect(t *testing.T, srv *mcp.Server) *mcp.ClientSession {
+	t.Helper()
 	ct, st := mcp.NewInMemoryTransports()
 	if _, err := srv.Connect(context.Background(), st, nil); err != nil {
 		t.Fatal(err)
@@ -82,7 +90,18 @@ func newServer(t *testing.T, opts Options) (*Registry, *mcp.ClientSession) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cs.Close() })
-	return reg, cs
+	return cs
+}
+
+// catchPanic runs f and returns what it panicked with, or "".
+func catchPanic(f func()) (msg string) {
+	defer func() {
+		if p := recover(); p != nil {
+			msg = fmt.Sprint(p)
+		}
+	}()
+	f()
+	return ""
 }
 
 func callCode(t *testing.T, cs *mcp.ClientSession, name, code string, extra map[string]any) (structured map[string]any, text string, isErr bool) {
@@ -231,7 +250,7 @@ func TestTimeoutKeepsLogs(t *testing.T) {
 	_, cs := newServer(t, Options{Namespace: "app", StripPrefix: "app_", MaxTimeout: 2 * time.Second, Sandbox: codemode.Options{Timeout: time.Second}})
 	start := time.Now()
 	st, text, isErr := callCode(t, cs, "code", `console.log("about to spin"); for(;;){}`, map[string]any{"timeout": "5s"})
-	if !isErr || !strings.Contains(text, "timed out after 2s") || !strings.Contains(text, "about to spin") || st["error"] != "timeout" {
+	if !isErr || !regexp.MustCompile(`timed out after 2(\.\d+)?s \(limit 2s\)`).MatchString(text) || !strings.Contains(text, "Pass a longer timeout (max 2s)") || !strings.Contains(text, "about to spin") || st["error"] != "timeout" {
 		t.Errorf("timeout report: %s", text)
 	}
 	if time.Since(start) > 4*time.Second {
@@ -239,8 +258,33 @@ func TestTimeoutKeepsLogs(t *testing.T) {
 	}
 	// Numeric timeout in seconds; a tool call gets cancelled too.
 	_, text, isErr = callCode(t, cs, "code", `await app.slow({ms: 10000})`, map[string]any{"timeout": 1})
-	if !isErr || !strings.Contains(text, "timed out after 1s") {
+	if !isErr || !strings.Contains(text, "(limit 1s)") {
 		t.Errorf("numeric timeout: %s", text)
+	}
+}
+
+// When the request's context has an earlier deadline than the script's
+// timeout, the report says so instead of suggesting a longer timeout, and
+// RunConfig.Cleanup runs.
+func TestTimeoutFromRequestDeadline(t *testing.T) {
+	var cleaned atomic.Int32
+	_, cs := newServer(t, Options{Sandbox: codemode.Options{Timeout: time.Minute}, Prepare: func(ctx context.Context, _ map[string]any) (*RunConfig, error) {
+		c, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		return &RunConfig{Context: c, Cleanup: func() { cleaned.Add(1); cancel() }}, nil
+	}})
+	st, text, isErr := callCode(t, cs, "code", `console.log("spin"); for(;;){}`, nil)
+	if !isErr || st["error"] != "timeout" || !strings.Contains(text, "the request's deadline passed before the script's 1m0s timeout") {
+		t.Errorf("deadline report: %s", text)
+	}
+	if strings.Contains(text, "Pass a longer timeout") || strings.Contains(text, "after 1m0s") || !strings.Contains(text, "spin") {
+		t.Errorf("deadline report names the wrong limit: %s", text)
+	}
+	if n := cleaned.Load(); n != 1 {
+		t.Errorf("cleanup ran %d times", n)
+	}
+	// Cleanup also runs after a successful script.
+	if _, text, isErr := callCode(t, cs, "code", `return 1`, nil); isErr || cleaned.Load() != 2 {
+		t.Errorf("cleanup after success: %d %s", cleaned.Load(), text)
 	}
 }
 
@@ -395,6 +439,8 @@ func TestCallAndUnwrap(t *testing.T) {
 		{"many texts", &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "a"}, &mcp.TextContent{Text: "b"}}}, nil, `["a","b"]`},
 		{"no content", &mcp.CallToolResult{}, nil, `null`},
 		{"nil result", nil, nil, `null`},
+		{"non-text content", &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: []byte("abc"), MIMEType: "image/png"}}}, nil, `[{"type":"image","mimeType":"image/png","data":"YWJj"}]`},
+		{"null structured counts as none", &mcp.CallToolResult{StructuredContent: json.RawMessage("null"), Content: []mcp.Content{&mcp.TextContent{Text: "[3]"}}}, nil, `[3]`},
 	}
 	for _, tc := range cases {
 		v, err := UnwrapResult(tc.res, tc.err)
@@ -416,7 +462,7 @@ func TestCallAndUnwrap(t *testing.T) {
 }
 
 func TestParseTimeout(t *testing.T) {
-	def := 60 * time.Second
+	def, limit := 60*time.Second, 10*time.Minute
 	cases := []struct {
 		in   any
 		want time.Duration
@@ -425,25 +471,71 @@ func TestParseTimeout(t *testing.T) {
 		{nil, def, false}, {"", def, false}, {"30s", 30 * time.Second, false}, {"2m", 2 * time.Minute, false},
 		{"5", 5 * time.Second, false}, {float64(1.5), 1500 * time.Millisecond, false}, {float64(0), def, false},
 		{"-1s", 0, true}, {"soon", 0, true}, {true, 0, true},
+		// Zero means the default, in every form.
+		{"0", def, false}, {"0s", def, false}, {float64(-3), def, false},
+		// NaN and infinities are errors, not 0s or overflow.
+		{"NaN", 0, true}, {"Inf", 0, true}, {"-Inf", 0, true}, {"+Inf", 0, true}, {"infinity", 0, true},
+		{math.NaN(), 0, true}, {math.Inf(1), 0, true}, {math.Inf(-1), 0, true},
+		// Clamped to [1ns, limit] before converting.
+		{"1e300", limit, false}, {float64(1e300), limit, false}, {"20m", limit, false}, {float64(3600), limit, false},
+		{"1e-12", time.Nanosecond, false}, {float64(1e-10), time.Nanosecond, false},
 	}
 	for _, tc := range cases {
-		got, err := parseTimeout(tc.in, def)
+		got, err := parseTimeout(tc.in, def, limit)
 		if (err != nil) != tc.err || got != tc.want {
 			t.Errorf("%v: got %s %v", tc.in, got, err)
 		}
 	}
 }
 
-func TestDuplicateToolPanics(t *testing.T) {
-	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil)
-	reg := New(srv, Options{Mode: ModeOnly})
-	reg.AddTool(&mcp.Tool{Name: "x"}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) { return nil, nil })
-	defer func() {
-		if recover() == nil {
-			t.Error("no panic on duplicate")
+// Two tools that a script would reach by the same name, or a tool named
+// like the code tool, panic at registration, naming both, in every mode;
+// the second tool is neither recorded nor registered on the server.
+func TestNameCollisionsPanic(t *testing.T) {
+	h := func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) { return nil, nil }
+	obj := &jsonschema.Schema{Type: "object"}
+	cases := []struct {
+		name          string
+		opts          Options
+		first, second string
+		want          []string
+	}{
+		{"same name", Options{}, "x", "x", []string{`tool "x" added twice`}},
+		{"stripped member", Options{StripPrefix: "x_"}, "x_capture", "capture", []string{`"capture"`, `"x_capture"`}},
+		{"stripped member, other order", Options{StripPrefix: "x_"}, "capture", "x_capture", []string{`"capture"`, `"x_capture"`}},
+		{"identifier member", Options{}, "a-b", "a_b", []string{`"a-b"`, `"a_b"`}},
+		{"named like the code tool", Options{}, "", "code", []string{`tool "code"`, `the code tool "code"`}},
+		{"member named like the code tool", Options{Name: "run", StripPrefix: "x_"}, "", "x_run", []string{`tool "x_run"`, `the code tool "run"`}},
+	}
+	for _, tc := range cases {
+		for _, mode := range []Mode{ModeOn, ModeOnly, ModeOff} {
+			srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+			opts := tc.opts
+			opts.Mode = mode
+			reg := New(srv, opts)
+			if tc.first != "" {
+				reg.AddTool(&mcp.Tool{Name: tc.first, InputSchema: obj}, h)
+			}
+			msg := catchPanic(func() { reg.AddTool(&mcp.Tool{Name: tc.second, InputSchema: obj}, h) })
+			for _, w := range tc.want {
+				if !strings.Contains(msg, w) {
+					t.Errorf("%s/%s: panic %q lacks %q", tc.name, mode, msg, w)
+				}
+			}
+			want := 0
+			if tc.first != "" {
+				want = 1
+			}
+			if got := len(reg.Tools()); got != want {
+				t.Errorf("%s/%s: %d tools recorded", tc.name, mode, got)
+			}
+			if mode != ModeOnly {
+				if names := toolNames(t, connect(t, srv)); len(names) != want {
+					t.Errorf("%s/%s: server tools %v", tc.name, mode, names)
+				}
+			}
 		}
-	}()
-	reg.AddTool(&mcp.Tool{Name: "x"}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) { return nil, nil })
+	}
 }
 
 // A member whose name equals a catalogue group (api vs api.*) must not
@@ -458,23 +550,242 @@ func TestDescribeGroupVersusMember(t *testing.T) {
 		return nil, map[string]any{"ok": true}, nil
 	})
 	reg.Register()
-	ct, st := mcp.NewInMemoryTransports()
-	if _, err := srv.Connect(context.Background(), st, nil); err != nil {
-		t.Fatal(err)
-	}
-	cs, err := mcp.NewClient(&mcp.Implementation{Name: "c", Version: "0"}, nil).Connect(context.Background(), ct, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cs.Close()
+	cs := connect(t, srv)
 	s, text, isErr := callCode(t, cs, "code", `
-		const [g, byName, byPath] = await Promise.all([describe("api"), describe("svc_api"), describe("svc.api")]);
-		return [g.members.length, g.kind, byName.path, byPath.path];`, nil)
+		const [g, byName, byPath, byNsName] = await Promise.all([describe("api"), describe("svc_api"), describe("svc.api"), describe("svc.svc_api")]);
+		return [g.members.length, g.kind, byName.path, byPath.path, byNsName.path];`, nil)
 	if isErr {
 		t.Fatal(text)
 	}
 	b, _ := json.Marshal(s["result"])
-	if string(b) != `[1,"namespace","svc.api","svc.api"]` {
+	if string(b) != `[1,"namespace","svc.api","svc.api","svc.api"]` {
 		t.Errorf("got %s", b)
+	}
+}
+
+// A result over MaxResultChars is clipped in the structured result too, and
+// error text is clipped.
+func TestClipsResultsAndErrors(t *testing.T) {
+	_, cs := newServer(t, Options{MaxResultChars: 100})
+	st, text, isErr := callCode(t, cs, "code", `return "x".repeat(200000)`, nil)
+	result, _ := st["result"].(string)
+	if isErr || st["truncated"] != true || !strings.Contains(result, "TRUNCATED") || len(result) > 400 || len(text) > 1000 {
+		t.Errorf("clipped result: structured %d chars, text %d chars", len(result), len(text))
+	}
+	if b, _ := json.Marshal(st); len(b) > 1000 {
+		t.Errorf("structured content is %d bytes", len(b))
+	}
+
+	st, text, isErr = callCode(t, cs, "code", `throw new Error("e".repeat(500000))`, nil)
+	msg, _ := st["error"].(string)
+	if !isErr || !strings.Contains(text, "TRUNCATED") || len(text) > 1000 || len(msg) > 400 {
+		t.Errorf("clipped error: text %d chars, structured %d chars", len(text), len(msg))
+	}
+}
+
+// Handlers called from a script get the code tool's session; a handler that
+// panics rejects the call instead of crashing the process; Registry.Call has
+// no session.
+func TestHandlersSeeSessionAndPanicsAreErrors(t *testing.T) {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+	reg := New(srv, Options{Mode: ModeOnly})
+	var seen atomic.Pointer[mcp.ServerSession]
+	AddTool(reg, &mcp.Tool{Name: "whoami"}, func(_ context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+		seen.Store(req.Session)
+		return nil, map[string]any{"id": req.Session.ID(), "name": req.Params.Name}, nil
+	})
+	reg.AddTool(&mcp.Tool{Name: "raw_whoami", InputSchema: &jsonschema.Schema{Type: "object"}}, func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "session " + req.Session.ID()}}}, nil
+	})
+	reg.AddTool(&mcp.Tool{Name: "boom", InputSchema: &jsonschema.Schema{Type: "object"}}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		panic("kaboom")
+	})
+	reg.Register()
+	cs := connect(t, srv)
+
+	st, text, isErr := callCode(t, cs, "code", `
+		const who = await tools.whoami({});
+		const raw = await tools.raw_whoami();
+		let caught = "";
+		try { await tools.boom({}); } catch (e) { caught = e.message; }
+		return {name: who.name, raw, caught};`, nil)
+	if isErr {
+		t.Fatalf("script: %s", text)
+	}
+	b, _ := json.Marshal(st["result"])
+	var out struct{ Name, Raw, Caught string }
+	_ = json.Unmarshal(b, &out)
+	if out.Name != "whoami" || !strings.HasPrefix(out.Raw, "session") || out.Caught != `tool "boom" panicked: kaboom` {
+		t.Errorf("result: %s", b)
+	}
+	var sessions []*mcp.ServerSession
+	for ss := range srv.Sessions() {
+		sessions = append(sessions, ss)
+	}
+	if len(sessions) != 1 || seen.Load() != sessions[0] {
+		t.Errorf("handler saw session %p, server has %v", seen.Load(), sessions)
+	}
+
+	// Registry.Call carries no session: the nil dereference is an error.
+	if _, err := reg.Call(context.Background(), "whoami", nil); err == nil || !strings.Contains(err.Error(), `tool "whoami" panicked`) {
+		t.Errorf("Call without session: %v", err)
+	}
+}
+
+// Tool names containing a dot are found by Call, Guidance and describe.
+func TestDottedToolNames(t *testing.T) {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+	reg := New(srv, Options{Namespace: "gh", Mode: ModeOnly})
+	AddTool(reg, &mcp.Tool{Name: "gh.search", Description: "Search issues."}, func(_ context.Context, _ *mcp.CallToolRequest, in struct {
+		Q string `json:"q"`
+	}) (*mcp.CallToolResult, any, error) {
+		return nil, map[string]any{"q": in.Q}, nil
+	})
+	if g := reg.Guidance(); !strings.Contains(g, "gh.gh_search(") {
+		t.Errorf("guidance: %s", g)
+	}
+	for _, name := range []string{"gh.search", "gh_search", "gh.gh_search"} {
+		if v, err := reg.Call(context.Background(), name, json.RawMessage(`{"q":"x"}`)); err != nil || string(v) != `{"q":"x"}` {
+			t.Errorf("Call(%q): %s %v", name, v, err)
+		}
+	}
+	reg.Register()
+	st, text, isErr := callCode(t, connect(t, srv), "code", `
+		const d = await describe("gh.search");
+		return [d.path, (await gh["gh.search"]({q: "y"})).q, (await gh.gh_search({q: "z"})).q];`, nil)
+	b, _ := json.Marshal(st["result"])
+	if isErr || string(b) != `["gh.gh_search","y","z"]` {
+		t.Errorf("script: %s %s", b, text)
+	}
+}
+
+// A tool added after Register shows up in the code tool's description.
+func TestAddToolAfterRegister(t *testing.T) {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+	reg := New(srv, Options{Namespace: "app", StripPrefix: "app_"})
+	AddTool(reg, &mcp.Tool{Name: "app_add", Description: "Add."}, func(_ context.Context, _ *mcp.CallToolRequest, in addIn) (*mcp.CallToolResult, addOut, error) {
+		return nil, addOut{Sum: in.A + in.B}, nil
+	})
+	reg.Register()
+	cs := connect(t, srv)
+	AddTool(reg, &mcp.Tool{Name: "app_late", Description: "Added late."}, func(context.Context, *mcp.CallToolRequest, any) (*mcp.CallToolResult, any, error) {
+		return nil, map[string]any{"late": true}, nil
+	})
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, tool := range res.Tools {
+		names = append(names, tool.Name)
+		if tool.Name == "code" && !strings.Contains(tool.Description, "add, late") {
+			t.Errorf("code description not refreshed: %s", tool.Description)
+		}
+	}
+	if len(names) != 3 {
+		t.Errorf("tools: %v", names)
+	}
+	if st, text, isErr := callCode(t, cs, "code", `return (await app.late()).late`, nil); isErr || st["result"] != true {
+		t.Errorf("late tool: %s", text)
+	}
+}
+
+// Tools the SDK rejects panic in every mode, with the SDK's message, before
+// anything is recorded; schemas the SDK accepts never panic.
+func TestToolChecksMatchSDK(t *testing.T) {
+	h := func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) { return nil, nil }
+	for _, mode := range []Mode{ModeOn, ModeOnly, ModeOff} {
+		reg := New(mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil), Options{Mode: mode})
+		msg := catchPanic(func() {
+			AddTool(reg, &mcp.Tool{Name: "str"}, func(context.Context, *mcp.CallToolRequest, string) (*mcp.CallToolResult, any, error) {
+				return nil, nil, nil
+			})
+		})
+		if !strings.Contains(msg, `input schema must have type "object"`) {
+			t.Errorf("%s: In=string: %q", mode, msg)
+		}
+		if msg := catchPanic(func() { reg.AddTool(&mcp.Tool{Name: "noschema"}, h) }); !strings.Contains(msg, "missing input schema") {
+			t.Errorf("%s: nil input schema: %q", mode, msg)
+		}
+		if n := len(reg.Tools()); n != 0 {
+			t.Errorf("%s: %d rejected tools recorded", mode, n)
+		}
+
+		// Accepted by (*mcp.Server).AddTool, so accepted here: an invalid
+		// default and a remote $ref.
+		msg = catchPanic(func() {
+			reg.AddTool(&mcp.Tool{Name: "bad_default", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"n": map[string]any{"type": "integer", "default": "seven"}}}}, h)
+			reg.AddTool(&mcp.Tool{Name: "remote_ref", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"x": map[string]any{"$ref": "https://example.com/x.json"}}}}, h)
+			_ = reg.Declarations()
+		})
+		if msg != "" || len(reg.Tools()) != 2 {
+			t.Errorf("%s: schemas the SDK accepts: %q", mode, msg)
+		}
+	}
+}
+
+// The registry keeps its own copy of a tool and leaves the caller's alone.
+func TestToolIsCopied(t *testing.T) {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+	reg := New(srv, Options{Mode: ModeOn})
+	typed := &mcp.Tool{Name: "typed", Description: "before"}
+	AddTool(reg, typed, func(_ context.Context, _ *mcp.CallToolRequest, in addIn) (*mcp.CallToolResult, addOut, error) {
+		return nil, addOut{Sum: in.A + in.B}, nil
+	})
+	raw := &mcp.Tool{Name: "raw", Description: "before", InputSchema: &jsonschema.Schema{Type: "object"}}
+	reg.AddTool(raw, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) { return nil, nil })
+	if typed.InputSchema != nil || typed.OutputSchema != nil {
+		t.Error("AddTool wrote schemas into the caller's tool")
+	}
+	typed.Description, raw.Description = "after", "after"
+	for _, tool := range reg.Tools() {
+		if tool.Description != "before" || tool.InputSchema == nil {
+			t.Errorf("recorded %s changed: %q", tool.Name, tool.Description)
+		}
+	}
+	if d, err := reg.Catalog().Describe("tools.typed"); err != nil || d["description"] != "before" {
+		t.Errorf("catalogue: %v %v", d, err)
+	}
+	res, err := connect(t, srv).ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Description != "before" {
+			t.Errorf("server %s: %q", tool.Name, tool.Description)
+		}
+	}
+}
+
+// Params values are validated before Prepare; the default timeout is
+// clamped to the maximum.
+func TestParamsAndTimeoutDefaults(t *testing.T) {
+	var prepared atomic.Int32
+	reg, cs := newServer(t, Options{
+		MaxTimeout: 30 * time.Second,
+		Sandbox:    codemode.Options{Timeout: 2 * time.Minute},
+		Params:     map[string]*jsonschema.Schema{"region": {Type: "string", Enum: []any{"eu", "us"}}},
+		Prepare: func(context.Context, map[string]any) (*RunConfig, error) {
+			prepared.Add(1)
+			return nil, nil
+		},
+	})
+	_, text, isErr := callCode(t, cs, "code", `return 1`, map[string]any{"region": "mars"})
+	if !isErr || !strings.Contains(text, "invalid arguments: region") || prepared.Load() != 0 {
+		t.Errorf("invalid param: %s (prepared %d)", text, prepared.Load())
+	}
+	if st, text, isErr := callCode(t, cs, "code", `return 1`, map[string]any{"region": "eu"}); isErr || st["result"] != float64(1) || prepared.Load() != 1 {
+		t.Errorf("valid param: %s", text)
+	}
+	if reg.opts.Sandbox.Timeout != 30*time.Second {
+		t.Errorf("default timeout %s", reg.opts.Sandbox.Timeout)
+	}
+	if d := reg.inputSchema().Properties["timeout"].Description; !strings.Contains(d, "Default 30s, max 30s") {
+		t.Errorf("timeout description: %s", d)
+	}
+	if msg := catchPanic(func() {
+		New(nil, Options{Params: map[string]*jsonschema.Schema{"bad": {Ref: "https://example.com/x.json"}}})
+	}); !strings.Contains(msg, `param "bad"`) {
+		t.Errorf("unresolvable param schema: %q", msg)
 	}
 }
