@@ -16,7 +16,13 @@
 //   - any extra globals, as async functions taking positional arguments
 //     (package catalog provides search and describe);
 //   - console.log and friends, captured for the host;
-//   - plain ECMAScript: no network, filesystem, timers, imports, or modules.
+//   - plain ECMAScript. The quickjs-libc helpers the underlying qjs build
+//     ships (std, os, print, setTimeout and friends) are removed from the
+//     global object; the VM's filesystem root is an empty read-only
+//     directory, its stdout and stderr are discarded, and it has no network
+//     and no environment. A dynamic import("qjs:os") can still reach the libc
+//     module; the README lists what that leaves open (a blocking sleep is the
+//     one that matters, and Run still returns on time).
 //
 // The code runs as the body of an async function, so it can use await at the
 // top level and return a value. Independent calls run concurrently with
@@ -30,6 +36,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,11 +51,13 @@ var preludeSource string
 
 // HostFunc handles one call from a script. args is the JSON the script
 // passed: an object for tools, an array of positional arguments for
-// globals. The returned JSON becomes the resolved value ("null" when
-// empty); an error rejects the promise with the error's message.
+// globals; it is always valid JSON. The returned JSON becomes the resolved
+// value ("null" when empty); an error rejects the promise with the error's
+// message.
 //
-// The context is cancelled when the script finishes, fails, or times out,
-// so a HostFunc that blocks must honour it.
+// The context is cancelled when the script finishes, fails, or times out.
+// A HostFunc that blocks must honour it: Run waits only briefly for host
+// calls after the script ends, and a call that ignores its context leaks.
 type HostFunc func(ctx context.Context, args json.RawMessage) (json.RawMessage, error)
 
 // Tool is one method of the script's namespace object.
@@ -73,15 +83,16 @@ type Options struct {
 	MaxCalls int
 	// MaxConcurrency caps host calls in flight. Default 8.
 	MaxConcurrency int
-	// MaxLogChars caps captured console output. Default 64 KiB.
+	// MaxLogChars caps captured console output. Default 64 KiB. Once the
+	// cap is reached, later lines are dropped and a marker line says so.
 	MaxLogChars int
 	// Hint is appended to the error a script gets for an unknown namespace
 	// member, after the did-you-mean suggestions. Hosts that provide
 	// discovery globals say so here (catalog.Hint builds one).
 	Hint string
-	// OnLog receives each console line as the script prints it, before any
-	// cap is applied. It runs on the script's goroutine, so it must return
-	// quickly. Optional.
+	// OnLog receives each console line the sandbox keeps, as the script
+	// prints it; lines dropped by MaxLogChars never reach it. It runs on the
+	// script's goroutine, so it must return quickly. Optional.
 	OnLog func(line string)
 }
 
@@ -119,8 +130,9 @@ type Output struct {
 }
 
 // ScriptError is a failure inside the script: a thrown value, a syntax
-// error, a stall, running out of memory, or exceeding the call limit. Logs
-// hold what the script printed before failing.
+// error, a stall, running out of memory, exceeding the call limit, or the
+// VM stopping unexpectedly. Logs hold what the script printed before
+// failing.
 type ScriptError struct {
 	Message string
 	Logs    []string
@@ -136,6 +148,8 @@ var ErrTimeout = errors.New("script timed out")
 // TimeoutError reports that the script exceeded its wall-clock limit. Logs
 // printed before the deadline are kept.
 type TimeoutError struct {
+	// Timeout is the limit that applied: Options.Timeout, or the time that
+	// was left on the context when it was shorter.
 	Timeout time.Duration
 	Logs    []string
 	Calls   int
@@ -143,29 +157,92 @@ type TimeoutError struct {
 }
 
 func (e *TimeoutError) Error() string {
-	return fmt.Sprintf("script timed out after %s; tool calls still running were cancelled", e.Timeout)
+	msg := "script timed out after " + e.Timeout.String()
+	if e.Calls > 0 {
+		msg += "; any tool call still running was cancelled"
+	}
+	return msg
 }
 
 // Unwrap makes errors.Is(err, ErrTimeout) true.
 func (e *TimeoutError) Unwrap() error { return ErrTimeout }
 
-var warmOnce sync.Once
+var (
+	warmOnce sync.Once
+	// warmErr is set when the sandbox cannot be trusted; Run then refuses.
+	warmErr error
+	// sandboxRoot is the empty read-only directory the VM sees as "/".
+	sandboxRoot string
+	// vmStopGrace is how long Run waits for the VM to stop after the
+	// deadline before returning without it (a libc sleep cannot be
+	// interrupted). A variable so tests can shorten it.
+	vmStopGrace = time.Second
+)
 
-// Warm compiles the QuickJS module so the first script does not pay for it
-// (about 300ms). It is safe to call from several goroutines and more than
-// once; typically hosts call it in a goroutine at start-up.
+// Warm prepares the sandbox so the first script does not pay for it (about
+// 300ms): it compiles the QuickJS module, creates the empty directory the
+// VM sees as its filesystem, and checks that a runaway script can be
+// stopped. It is safe to call from several goroutines and more than once;
+// Run calls it, and hosts typically call it in a goroutine at start-up.
 //
-// qjs compiles the module once per process and bakes CloseOnContextDone into
-// that compilation, so every qjs.New in this package passes the flag: a
-// runtime created without it would silently disable the hard timeout for all
-// later scripts.
-func Warm() {
-	warmOnce.Do(func() {
-		rt, err := qjs.New(qjs.Option{Context: context.Background(), CloseOnContextDone: true, MemoryLimit: 16 << 20})
-		if err == nil {
-			rt.Close()
+// qjs compiles the module once per process and bakes CloseOnContextDone (the
+// mechanism behind the timeout) into that compilation. Warm forces a
+// compilation with the flag set, so a runtime another library created
+// without it cannot disable timeouts here; if the check still fails, every
+// Run returns an error instead of running scripts without a deadline.
+func Warm() { warmOnce.Do(warm) }
+
+func warm() {
+	dir, err := os.MkdirTemp("", "codemode-sandbox-")
+	if err != nil {
+		warmErr = fmt.Errorf("create sandbox root: %w", err)
+		return
+	}
+	_ = os.Chmod(dir, 0o555)
+	sandboxRoot = dir
+
+	rt, err := qjs.New(vmOption(context.Background(), 16<<20, true))
+	if err != nil {
+		warmErr = fmt.Errorf("compile sandbox: %w", err)
+		return
+	}
+	rt.Close()
+
+	// Self-test: a busy loop with a short deadline must stop.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() { _ = recover() }()
+		rt, err := qjs.New(vmOption(ctx, 16<<20, false))
+		if err != nil {
+			return
 		}
-	})
+		defer func() {
+			defer func() { _ = recover() }()
+			rt.Close()
+		}()
+		_, _ = rt.Context().Eval("warm.js", qjs.Code("for(;;){}"))
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		warmErr = errors.New("the sandbox cannot interrupt scripts (the qjs module in use was compiled without CloseOnContextDone)")
+	}
+}
+
+func vmOption(ctx context.Context, memory int, recompile bool) qjs.Option {
+	return qjs.Option{
+		Context:            ctx,
+		CloseOnContextDone: true,
+		DisableBuildCache:  recompile,
+		MemoryLimit:        memory,
+		MaxStackSize:       1 << 20,
+		CWD:                sandboxRoot,
+		Stdout:             io.Discard,
+		Stderr:             io.Discard,
+	}
 }
 
 // Runner runs scripts against a fixed set of tools and globals. It is safe
@@ -227,20 +304,32 @@ type logSink struct {
 }
 
 func (l *logSink) add(line string) {
-	if l.onLog != nil {
-		l.onLog(line)
-	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.chars+len(line) > l.max {
-		if !l.dropped {
-			l.dropped = true
-			l.lines = append(l.lines, "--- further console output dropped (limit "+strconv.Itoa(l.max)+" chars) ---")
-		}
+	if l.dropped {
+		l.mu.Unlock()
 		return
 	}
-	l.chars += len(line)
-	l.lines = append(l.lines, line)
+	keep := ""
+	if room := l.max - l.chars; len(line) <= room {
+		keep = line
+	} else {
+		l.dropped = true
+		if room >= 256 {
+			head := line[:room-96]
+			keep = head + "… (" + strconv.Itoa(len(line)-len(head)) + " more characters cut)"
+		}
+	}
+	if keep != "" {
+		l.chars += len(keep)
+		l.lines = append(l.lines, keep)
+	}
+	if l.dropped {
+		l.lines = append(l.lines, "--- further console output dropped (limit "+strconv.Itoa(l.max)+" chars) ---")
+	}
+	l.mu.Unlock()
+	if keep != "" && l.onLog != nil {
+		l.onLog(keep)
+	}
 }
 
 func (l *logSink) snapshot() []string {
@@ -251,182 +340,262 @@ func (l *logSink) snapshot() []string {
 	return out
 }
 
-// Run executes code in a fresh VM.
-//
-// Errors: *ScriptError for failures inside the script, *TimeoutError (which
-// wraps ErrTimeout) when the deadline passes, an error wrapping
-// context.Canceled when ctx is cancelled, and other errors when the sandbox
-// itself cannot start.
-func (r *Runner) Run(ctx context.Context, code string) (out Output, err error) {
-	opts := r.opts
-	start := time.Now()
-	limit := opts.Timeout
-	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < limit {
-		limit = time.Until(dl)
-	}
-	ctx, cancel := context.WithTimeout(ctx, limit)
-	defer cancel()
+// session is the state one Run shares between the VM goroutine and the host
+// call goroutines.
+type session struct {
+	r       *Runner
+	ctx     context.Context
+	opts    Options
+	results chan hostResult
+	sem     chan struct{}
+	logs    *logSink
+	wg      sync.WaitGroup
 
-	rt, err := qjs.New(qjs.Option{
-		Context:            ctx,
-		CloseOnContextDone: true,
-		MemoryLimit:        opts.MemoryLimit,
-		MaxStackSize:       1 << 20,
-	})
-	if err != nil {
-		return out, fmt.Errorf("start sandbox: %w", err)
+	mu     sync.Mutex
+	calls  int
+	result string // JSON of the return value, "" until reported
+}
+
+// deliver hands a completed call to the driver, or gives up when the run is
+// over (the channel holds every call that can be started, so this only
+// blocks after a cancellation).
+func (s *session) deliver(res hostResult) {
+	select {
+	case s.results <- res:
+	case <-s.ctx.Done():
+	}
+}
+
+func (s *session) hostCall(this *qjs.This) (*qjs.Value, error) {
+	a := this.Args()
+	if len(a) < 4 {
+		return nil, errors.New("bad host call")
+	}
+	id, kind, name, args := int(a[0].Int32()), a[1].String(), a[2].String(), a[3].String()
+	s.mu.Lock()
+	s.calls++
+	n := s.calls
+	s.mu.Unlock()
+	if n > s.opts.MaxCalls {
+		return nil, fmt.Errorf("too many host calls: limit is %d per script", s.opts.MaxCalls)
+	}
+	var fn HostFunc
+	switch kind {
+	case "tool":
+		fn = s.r.tools[name]
+	case "global":
+		fn = s.r.globals[name]
+	}
+	if fn == nil {
+		return nil, fmt.Errorf("unknown %s %q", kind, name)
+	}
+	if !json.Valid([]byte(args)) {
+		return nil, errors.New("arguments are not valid JSON")
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		select {
+		case s.sem <- struct{}{}:
+			defer func() { <-s.sem }()
+		case <-s.ctx.Done():
+			s.deliver(hostResult{ID: id, Error: "cancelled: " + s.ctx.Err().Error()})
+			return
+		}
+		res, err := s.call(fn, json.RawMessage(args))
+		if err != nil {
+			s.deliver(hostResult{ID: id, Error: err.Error()})
+			return
+		}
+		out := string(res)
+		if strings.TrimSpace(out) == "" {
+			out = "null"
+		}
+		s.deliver(hostResult{ID: id, OK: true, Payload: &out})
+	}()
+	return this.Context().NewUndefined(), nil
+}
+
+// call runs a HostFunc, turning a panic into an error so one bad tool does
+// not take the process down.
+func (s *session) call(fn HostFunc, args json.RawMessage) (res json.RawMessage, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("tool panicked: %s", firstLine(fmt.Sprint(rec)))
+		}
+	}()
+	return fn(s.ctx, args)
+}
+
+func (s *session) hostWait(this *qjs.This) (*qjs.Value, error) {
+	select {
+	case res := <-s.results:
+		b, _ := json.Marshal(res)
+		return this.Context().NewString(string(b)), nil
+	case <-s.ctx.Done():
+		return nil, errors.New("deadline exceeded while waiting for tool calls")
+	}
+}
+
+func (s *session) hostLog(this *qjs.This) (*qjs.Value, error) {
+	if a := this.Args(); len(a) > 0 {
+		s.logs.add(a[0].String())
+	}
+	return this.Context().NewUndefined(), nil
+}
+
+// hostResult receives the JSON of the return value from the prelude's
+// driver; the first report wins.
+func (s *session) hostResult(this *qjs.This) (*qjs.Value, error) {
+	if a := this.Args(); len(a) > 0 {
+		s.mu.Lock()
+		if s.result == "" {
+			s.result = a[0].String()
+		}
+		s.mu.Unlock()
+	}
+	return this.Context().NewUndefined(), nil
+}
+
+// execute runs the prelude and the script in a fresh VM. It returns a
+// *ScriptError for failures inside the script, the context's error when the
+// deadline passed, or another error when the VM cannot start.
+func (s *session) execute(code string) (err error) {
+	rt, e := qjs.New(vmOption(s.ctx, s.opts.MemoryLimit, false))
+	if e != nil {
+		if s.ctx.Err() != nil {
+			return s.ctx.Err()
+		}
+		return fmt.Errorf("start sandbox: %w", e)
 	}
 	// Close panics when the module was already torn down by the deadline.
 	defer func() {
 		defer func() { _ = recover() }()
 		rt.Close()
 	}()
-	c := rt.Context()
-
-	results := make(chan hostResult, 256)
-	sem := make(chan struct{}, opts.MaxConcurrency)
-	logs := &logSink{max: opts.MaxLogChars, onLog: opts.OnLog}
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	calls := 0
-
-	c.SetFunc("__host_call", func(this *qjs.This) (*qjs.Value, error) {
-		a := this.Args()
-		if len(a) < 4 {
-			return nil, fmt.Errorf("bad host call")
-		}
-		id, kind, name, args := int(a[0].Int32()), a[1].String(), a[2].String(), a[3].String()
-		mu.Lock()
-		calls++
-		n := calls
-		mu.Unlock()
-		if n > opts.MaxCalls {
-			results <- hostResult{ID: id, Error: fmt.Sprintf("too many host calls: limit is %d per script", opts.MaxCalls)}
-			return this.Context().NewUndefined(), nil
-		}
-		var fn HostFunc
-		switch kind {
-		case "tool":
-			fn = r.tools[name]
-		case "global":
-			fn = r.globals[name]
-		}
-		if fn == nil {
-			results <- hostResult{ID: id, Error: fmt.Sprintf("unknown %s %q", kind, name)}
-			return this.Context().NewUndefined(), nil
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				results <- hostResult{ID: id, Error: "cancelled: " + ctx.Err().Error()}
+	defer func() {
+		if rec := recover(); rec != nil {
+			if s.ctx.Err() != nil {
+				err = s.ctx.Err()
 				return
 			}
-			res, err := fn(ctx, json.RawMessage(args))
-			if err != nil {
-				results <- hostResult{ID: id, Error: err.Error()}
-				return
-			}
-			s := string(res)
-			if strings.TrimSpace(s) == "" {
-				s = "null"
-			}
-			results <- hostResult{ID: id, OK: true, Payload: &s}
-		}()
-		return this.Context().NewUndefined(), nil
-	})
-	c.SetFunc("__host_wait", func(this *qjs.This) (*qjs.Value, error) {
-		select {
-		case res := <-results:
-			b, _ := json.Marshal(res)
-			return this.Context().NewString(string(b)), nil
-		case <-ctx.Done():
-			return nil, fmt.Errorf("deadline exceeded while waiting for tool calls")
-		}
-	})
-	c.SetFunc("__host_log", func(this *qjs.This) (*qjs.Value, error) {
-		if a := this.Args(); len(a) > 0 {
-			logs.add(a[0].String())
-		}
-		return this.Context().NewUndefined(), nil
-	})
-
-	var resultJSON string
-	func() {
-		defer func() {
-			if rec := recover(); rec != nil {
-				if ctx.Err() != nil {
-					err = ctx.Err()
-				} else {
-					err = fmt.Errorf("sandbox crashed: %v", rec)
-				}
-			}
-		}()
-		pre, e := c.Eval("codemode-prelude.js", qjs.Code(preludeSource))
-		if e != nil {
-			err = fmt.Errorf("prelude: %w", e)
-			return
-		}
-		defer pre.Free()
-		args := []*qjs.Value{c.NewString(opts.Namespace), c.NewString(r.toolsJSON), c.NewString(r.globalsJSON), c.NewString(opts.Hint)}
-		for _, a := range args {
-			defer a.Free()
-		}
-		v, e := c.Invoke(pre, c.Global(), args...)
-		if e != nil {
-			err = fmt.Errorf("prelude: %w", e)
-			return
-		}
-		v.Free()
-
-		wrapped := "await __drive((async () => {\n" + code + "\n})())"
-		v, e = c.Eval("script.js", qjs.Code(wrapped), qjs.FlagAsync())
-		if e != nil {
-			if ctx.Err() != nil {
-				err = ctx.Err()
-				return
-			}
-			err = &ScriptError{Message: cleanJSError(e.Error())}
-			return
-		}
-		v.Free()
-		// The prelude stores the JSON of the return value on a global; a
-		// value read straight from the eval result can be freed too early.
-		rv := c.Global().GetPropertyStr("__result")
-		defer rv.Free()
-		resultJSON = "null"
-		if rv.IsString() {
-			if s := rv.String(); s != "" {
-				resultJSON = s
-			}
+			err = &ScriptError{Message: crashMessage(fmt.Sprint(rec))}
 		}
 	}()
+	c := rt.Context()
+	c.SetFunc("__host_call", s.hostCall)
+	c.SetFunc("__host_wait", s.hostWait)
+	c.SetFunc("__host_log", s.hostLog)
+	c.SetFunc("__host_result", s.hostResult)
 
+	pre, e := c.Eval("codemode-prelude.js", qjs.Code(preludeSource))
+	if e != nil {
+		return fmt.Errorf("prelude: %w", e)
+	}
+	defer pre.Free()
+	args := []*qjs.Value{c.NewString(s.opts.Namespace), c.NewString(s.r.toolsJSON), c.NewString(s.r.globalsJSON), c.NewString(s.opts.Hint)}
+	for _, a := range args {
+		defer a.Free()
+	}
+	v, e := c.Invoke(pre, c.Global(), args...)
+	if e != nil {
+		return fmt.Errorf("prelude: %w", e)
+	}
+	v.Free()
+
+	// The script starts on line 1 so stack traces match the model's code.
+	wrapped := "await __drive((async () => {" + code + "\n})())"
+	v, e = c.Eval("script.js", qjs.Code(wrapped), qjs.FlagAsync())
+	if e != nil {
+		if s.ctx.Err() != nil {
+			return s.ctx.Err()
+		}
+		return &ScriptError{Message: cleanJSError(e.Error())}
+	}
+	v.Free()
+	return nil
+}
+
+// Run executes code in a fresh VM.
+//
+// Errors: *ScriptError for failures inside the script, *TimeoutError (which
+// wraps ErrTimeout) when the deadline passes, an error wrapping
+// context.Canceled when ctx is cancelled, and other errors when the sandbox
+// itself cannot start.
+func (r *Runner) Run(ctx context.Context, code string) (Output, error) {
+	Warm()
+	if warmErr != nil {
+		return Output{}, fmt.Errorf("start sandbox: %w", warmErr)
+	}
+	opts := r.opts
+	start := time.Now()
+	limit := opts.Timeout
+	if dl, ok := ctx.Deadline(); ok {
+		if left := time.Until(dl); left < limit {
+			limit = max(left, 0)
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+
+	s := &session{
+		r:       r,
+		ctx:     ctx,
+		opts:    opts,
+		results: make(chan hostResult, min(opts.MaxCalls, 1024)),
+		sem:     make(chan struct{}, opts.MaxConcurrency),
+		logs:    &logSink{max: opts.MaxLogChars, onLog: opts.OnLog},
+	}
+
+	// The VM runs on its own goroutine so Run can return on the deadline
+	// even when the VM is blocked where wazero cannot stop it.
+	done := make(chan error, 1)
+	go func() { done <- s.execute(code) }()
+	var err error
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		select {
+		case err = <-done:
+		case <-time.After(vmStopGrace):
+			err = ctx.Err()
+		}
+	}
 	elapsed := time.Since(start)
-	mu.Lock()
-	n := calls
-	mu.Unlock()
+
 	cancel()
-	wg.Wait()
-	lines := logs.snapshot()
+	waited := make(chan struct{})
+	go func() { s.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(vmStopGrace):
+	}
+
+	s.mu.Lock()
+	n, result := s.calls, s.result
+	s.mu.Unlock()
+	lines := s.logs.snapshot()
 
 	switch e := err.(type) {
 	case nil:
-		return Output{Result: json.RawMessage(resultJSON), Logs: lines, Calls: n, Elapsed: elapsed}, nil
+		if result == "" {
+			result = "null"
+		}
+		if !json.Valid([]byte(result)) {
+			return Output{}, &ScriptError{Message: "the script's return value is not valid JSON", Logs: lines, Calls: n, Elapsed: elapsed}
+		}
+		return Output{Result: json.RawMessage(result), Logs: lines, Calls: n, Elapsed: elapsed}, nil
 	case *ScriptError:
 		e.Logs, e.Calls, e.Elapsed = lines, n, elapsed
-		return out, e
+		return Output{}, e
 	default:
 		if errors.Is(err, context.DeadlineExceeded) {
-			return out, &TimeoutError{Timeout: limit, Logs: lines, Calls: n, Elapsed: elapsed}
+			return Output{}, &TimeoutError{Timeout: limit, Logs: lines, Calls: n, Elapsed: elapsed}
 		}
 		if errors.Is(err, context.Canceled) {
-			return out, fmt.Errorf("script cancelled: %w", err)
+			return Output{}, fmt.Errorf("script cancelled: %w", err)
 		}
-		return out, err
+		return Output{}, err
 	}
 }
 
@@ -440,6 +609,29 @@ func cleanJSError(msg string) string {
 		keep = append(keep, line)
 	}
 	return strings.TrimRight(strings.Join(keep, "\n"), "\n")
+}
+
+// crashMessage describes a panic from the VM. A script that reaches the
+// libc exit through import("qjs:std") ends the module with an exit code;
+// anything else is reported as is, shortened.
+func crashMessage(rec string) string {
+	if i := strings.Index(rec, "exit_code("); i >= 0 {
+		code := rec[i+len("exit_code("):]
+		if j := strings.IndexByte(code, ')'); j >= 0 {
+			return "the script called exit(" + code[:j] + "), which ends the sandbox without a result"
+		}
+	}
+	return "the sandbox stopped: " + firstLine(rec)
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 200 {
+		s = s[:200] + "…"
+	}
+	return s
 }
 
 // identifier makes a JavaScript identifier out of a name: characters that

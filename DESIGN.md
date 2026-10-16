@@ -36,20 +36,21 @@ type Options struct {
     MemoryLimit    int           // VM heap bytes; default 64 MiB
     MaxCalls       int           // host calls per script; default 200
     MaxConcurrency int           // host calls in flight; default 8
-    MaxLogChars    int           // captured console chars; default 64 KiB
+    MaxLogChars    int           // captured console chars; default 64 KiB; once reached, later lines are dropped
     Hint           string        // appended to "ns.x does not exist" errors (catalog.Hint supplies one)
-    OnLog          func(line string) // receives each console line as it is printed; optional
+    OnLog          func(line string) // receives each kept console line as it is printed; optional
 }
 
 type Output struct { Result json.RawMessage; Logs []string; Calls int; Elapsed time.Duration }
 
-// ScriptError: thrown value, syntax error, stall, out of memory, call limit.
+// ScriptError: thrown value, syntax error, stall, out of memory, call limit, VM stopped (exit).
 type ScriptError struct { Message string; Logs []string; Calls int; Elapsed time.Duration }
 var ErrTimeout = errors.New("script timed out")
 // TimeoutError unwraps to ErrTimeout. Logs printed before the deadline are kept.
+// Timeout is the limit that applied: Options.Timeout or the shorter ctx deadline.
 type TimeoutError struct { Timeout time.Duration; Logs []string; Calls int; Elapsed time.Duration }
 
-func Warm()                                   // compile the wasm module early; safe to call many times
+func Warm()                                   // compile the wasm module, create the empty root, self-test the deadline; Run calls it
 func Run(ctx context.Context, code string, tools []Tool, globals map[string]HostFunc, opts Options) (Output, error)
 type Runner struct{ /* static tools, globals, options */ }
 func NewRunner(tools []Tool, globals map[string]HostFunc, opts Options) *Runner
@@ -71,12 +72,34 @@ Semantics:
 - If ctx is cancelled (not a deadline) the error wraps `context.Canceled`.
   A deadline, from ctx or from Timeout, gives `*TimeoutError`.
 - In-flight host calls are cancelled through their ctx when the script ends.
+  Run waits one grace period (1s) for them; a HostFunc that ignores its ctx
+  leaks. A HostFunc that panics rejects the call with "tool panicked: ...".
+- Calls over `MaxCalls`, unknown names and non-JSON arguments are rejected
+  synchronously by the host (the promise rejects); they never occupy the
+  result channel, so a fire-and-forget burst cannot wedge a run. `Calls`
+  counts every attempt.
 - Console lines are captured on the host side, so they survive timeouts and
-  out-of-memory; `OnLog` sees them live. The cap adds one final line
-  `--- further console output dropped (limit N chars) ---`.
-- `__host_call`, `__host_wait`, `__host_log` are removed from `globalThis`
-  by the prelude; scripts cannot reach the host except through the namespace
-  and globals.
+  out-of-memory; `OnLog` sees the kept lines live. When a line would exceed
+  the cap it is cut (or dropped when little room is left), one marker line
+  `--- further console output dropped (limit N chars) ---` is added, and
+  every later line is dropped.
+- The return value reaches the host through a closure-held host function the
+  driver calls once (first report wins) and is checked with `json.Valid`;
+  a script cannot forge it through a global.
+- The prelude removes `__host_*`, the quickjs-libc globals (`std`, `os`,
+  `bjson`, `print`, `setTimeout`, `setInterval`, `clearTimeout`,
+  `clearInterval`, `scriptArgs`, `gc`) and qjs's `QJS_PROXY_VALUE` from
+  `globalThis`, pins `Function.prototype.call`/`apply`, and `__drive` removes
+  itself on first use. The VM's filesystem root is an empty read-only
+  directory, its stdout/stderr go to `io.Discard`, it has no environment and
+  no network. A dynamic `import("qjs:os")`/`import("qjs:std")` still works
+  (the module loader is C-level): it can list the empty root, fail to write,
+  sleep, set libc timers, or call `std.exit`. Exit becomes a `ScriptError`
+  mentioning `exit(N)`; a sleep or timer cannot be interrupted, so Run
+  returns a `TimeoutError` after the deadline plus a grace period (1s) and
+  the VM goroutine ends when the sleep does.
+- The script starts on line 1 of `script.js`, so stack traces match the
+  model's code; prelude frames are stripped.
 
 ## package catalog
 
@@ -251,11 +274,20 @@ tests use `mcp.NewInMemoryTransports` with a real `*mcp.Server` and
 ## fastschema/qjs facts the sandbox relies on
 
 - `CloseOnContextDone` is baked into a process-wide compiled module on the
-  first `qjs.New`; every `qjs.New` in this module passes it.
+  first `qjs.New`. `Warm` passes `DisableBuildCache: true` once so the module
+  is recompiled with the flag whatever ran before, then self-tests a busy
+  loop against a 50ms deadline; if that fails, every `Run` returns an error.
 - `MaxExecutionTime` is not enforced; the hard timeout is the ctx deadline
   closing the module. `Eval` and `rt.Close()` then panic and are recovered.
+  wazero checks the ctx at function calls and loop back-edges, not inside a
+  host call: `os.sleep` and libc timers (`WithSysNanosleep`) block until
+  they end, hence the VM goroutine and the grace period in `Run`.
+- The wasm build includes quickjs-libc (`qjs:std`, `qjs:os`, `qjs:bjson`,
+  `js_std_add_helpers`); `Option.CWD` defaults to the process working
+  directory mounted at "/" and `Stdout`/`Stderr` to the real ones, so the
+  sandbox always sets all three.
 - Values returned from `Eval`/`Invoke` are unreliable for short-lived
-  strings; the result travels through the global `__result`.
+  strings; the result travels through the `__host_result` host function.
 - `SetAsyncFunc` resolves synchronously; async host calls use the
   `__host_call` / `__host_wait` pump with the `__drive` loop in the prelude.
 - Strings passed as arguments into Go `SetFunc` callbacks are reliable.

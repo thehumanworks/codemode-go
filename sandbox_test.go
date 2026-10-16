@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -273,5 +274,168 @@ func TestClip(t *testing.T) {
 	}
 	if o, c := Clip("short", 300); c || o != "short" {
 		t.Error("no clip expected")
+	}
+}
+
+// shortGrace makes the deadline watchdog return quickly for tests that block
+// the VM where wazero cannot stop it.
+func shortGrace(t *testing.T) {
+	t.Helper()
+	old := vmStopGrace
+	vmStopGrace = 200 * time.Millisecond
+	t.Cleanup(func() { vmStopGrace = old })
+}
+
+func TestSandboxIsolation(t *testing.T) {
+	// The quickjs-libc helpers and qjs's own class are gone from globalThis.
+	out, err := run(t, `return Object.getOwnPropertyNames(globalThis).filter(n => /QJS|__host|^std$|^os$|^print$|Timeout|Interval|scriptArgs|bjson|^gc$/.test(n)).concat([typeof setTimeout, typeof print, typeof std])`, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out.Result) != `["undefined","undefined","undefined"]` {
+		t.Errorf("libc globals still visible: %s", out.Result)
+	}
+	// What a dynamic import of the libc modules can reach: an empty
+	// read-only root, no environment, discarded output.
+	out, err = run(t, `
+		let os, std;
+		try { os = await import("qjs:os"); std = await import("qjs:std"); } catch (e) { return "import failed"; }
+		const [ents] = os.readdir("/");
+		const f = std.open("/x.txt", "w");
+		if (f) { f.close(); }
+		std.out.puts("codemode isolation test: this line must not reach the process stdout\n");
+		return {ents, cwd: os.getcwd()[0], passwd: std.loadFile("/etc/passwd"), env: Object.keys(std.getenviron()).length, wrote: f !== null, exec: typeof os.exec};`, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(out.Result); got != `"import failed"` && got != `{"ents":[".",".."],"cwd":"/","passwd":null,"env":0,"wrote":false,"exec":"undefined"}` {
+		t.Errorf("libc reach: %s", got)
+	}
+}
+
+func TestRunReturnsWhileVMSleeps(t *testing.T) {
+	shortGrace(t)
+	// os.sleep blocks inside the wasm module where the deadline cannot stop
+	// it; Run still returns after the grace period with the logs so far.
+	for _, code := range []string{
+		`console.log("before"); const os = await import("qjs:os"); os.sleep(1500); return "slept"`,
+		`console.log("before"); const os = await import("qjs:os"); await new Promise(r => os.setTimeout(r, 1500)); return "fired"`,
+	} {
+		start := time.Now()
+		_, err := run(t, code, Options{Timeout: 150 * time.Millisecond})
+		var te *TimeoutError
+		if !errors.As(err, &te) {
+			t.Fatalf("%s: want timeout, got %v", code, err)
+		}
+		if d := time.Since(start); d > time.Second {
+			t.Errorf("Run took %s", d)
+		}
+		if len(te.Logs) != 1 || te.Logs[0] != "before" || te.Timeout != 150*time.Millisecond {
+			t.Errorf("timeout error: %+v", te)
+		}
+	}
+}
+
+func TestRunExitAndCrash(t *testing.T) {
+	_, err := run(t, `const std = await import("qjs:std"); std.exit(3); return 1`, Options{})
+	var se *ScriptError
+	if !errors.As(err, &se) || !strings.Contains(se.Message, "exit(3)") {
+		t.Errorf("exit: %v", err)
+	}
+	// A HostFunc that panics rejects the call instead of ending the process.
+	tools := append(testTools(), Tool{Name: "boom", Call: func(context.Context, json.RawMessage) (json.RawMessage, error) { panic("kaboom") }})
+	out, err := Run(context.Background(), `try { await app.boom({}); } catch (e) { return e.message; }`, tools, nil, Options{Namespace: "app"})
+	if err != nil || string(out.Result) != `"tool panicked: kaboom"` {
+		t.Errorf("panic: %s %v", out.Result, err)
+	}
+}
+
+func TestRunCallBursts(t *testing.T) {
+	// Calls over the limit fail synchronously, so neither a fire-and-forget
+	// burst nor an awaited one can wedge the result channel.
+	out, err := run(t, `for (let i = 0; i < 600; i++) rex.echo({i}).catch(() => {}); return "done"`, Options{})
+	if err != nil || string(out.Result) != `"done"` || out.Calls != 600 {
+		t.Errorf("fire and forget: %s %d %v", out.Result, out.Calls, err)
+	}
+	out, err = run(t, `try { await Promise.all(Array.from({length: 600}, (_, i) => rex.echo({i}))); } catch (e) { return e.message; }`, Options{})
+	if err != nil || string(out.Result) != `"too many host calls: limit is 200 per script"` {
+		t.Errorf("awaited: %s %v", out.Result, err)
+	}
+	// Unknown names reported by the host are catchable too.
+	out, err = run(t, `try { await rex.t_echo.call(null, {}); return "called"; } catch (e) { return e.message; }`, Options{})
+	if err != nil || string(out.Result) != `"called"` {
+		t.Errorf("full name call: %s %v", out.Result, err)
+	}
+}
+
+func TestRunResultIntegrity(t *testing.T) {
+	out, err := run(t, `globalThis.__result = "{not json"; return {host: typeof __host_result, drive: typeof __drive}`, Options{})
+	if err != nil || string(out.Result) != `{"host":"undefined","drive":"function"}` {
+		t.Errorf("forged global: %s %v", out.Result, err)
+	}
+	// The driver cannot be re-entered by the script to report another value.
+	_, err = run(t, `await __drive(Promise.resolve(2)); return 1`, Options{})
+	var se *ScriptError
+	if !errors.As(err, &se) || !strings.Contains(se.Message, "__drive is not available") {
+		t.Errorf("second drive: %v", err)
+	}
+	// Function.prototype.call and apply are pinned.
+	out, err = run(t, `const c = Function.prototype.call; try { Function.prototype.call = () => 1; } catch {} return Function.prototype.call === c && Object.getOwnPropertyDescriptor(Function.prototype, "apply").writable === false`, Options{})
+	if err != nil || string(out.Result) != "true" {
+		t.Errorf("pinned call: %s %v", out.Result, err)
+	}
+}
+
+func TestRunStackLineNumbers(t *testing.T) {
+	_, err := run(t, "const a = 1;\nconst b = 2;\nthrow new Error('line three')", Options{})
+	var se *ScriptError
+	if !errors.As(err, &se) || !strings.Contains(se.Message, "script.js:3:") || strings.Contains(se.Message, "prelude") {
+		t.Errorf("stack: %v", err)
+	}
+}
+
+func TestRunExpiredContext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+	_, err := Run(ctx, `return 1`, testTools(), nil, Options{})
+	var te *TimeoutError
+	if !errors.As(err, &te) || te.Timeout != 0 {
+		t.Errorf("expired context: %v", err)
+	}
+	if strings.Contains(err.Error(), "cancelled") {
+		t.Errorf("message mentions cancelled calls with none started: %v", err)
+	}
+}
+
+func TestLogCapDropsEverythingAfterMarker(t *testing.T) {
+	var seen []string
+	out, err := run(t, `console.log("x".repeat(5000)); console.log("after1"); console.log("after2"); return 1`, Options{MaxLogChars: 1000, OnLog: func(l string) { seen = append(seen, l) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Logs) != 2 || len(out.Logs[0]) > 1000 || !strings.Contains(out.Logs[0], "more characters cut") || !strings.Contains(out.Logs[1], "dropped") {
+		t.Errorf("oversized line: %d lines, first %d chars", len(out.Logs), len(out.Logs[0]))
+	}
+	if len(seen) != 1 || seen[0] != out.Logs[0] {
+		t.Errorf("OnLog saw %d lines, want only the kept one", len(seen))
+	}
+	// Too little room left: the oversized line is dropped whole.
+	out, err = run(t, `console.log("ok"); console.log("x".repeat(5000)); console.log("after"); return 1`, Options{MaxLogChars: 100})
+	if err != nil || len(out.Logs) != 2 || out.Logs[0] != "ok" || !strings.Contains(out.Logs[1], "dropped") {
+		t.Errorf("small cap: %q %v", out.Logs, err)
+	}
+}
+
+func TestWarmSelfTest(t *testing.T) {
+	Warm()
+	if warmErr != nil {
+		t.Fatal(warmErr)
+	}
+	fi, err := os.Stat(sandboxRoot)
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("sandbox root: %v", err)
+	}
+	if entries, _ := os.ReadDir(sandboxRoot); len(entries) != 0 {
+		t.Errorf("sandbox root is not empty: %d entries", len(entries))
 	}
 }

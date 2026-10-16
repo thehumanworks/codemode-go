@@ -18,9 +18,11 @@ The library follows the pattern that Cloudflare's
 
 The sandbox is QuickJS compiled to WebAssembly, executed by
 [wazero](https://wazero.io) through [fastschema/qjs](https://github.com/fastschema/qjs).
-No cgo, no network, no filesystem, no timers, no modules. Every run is bounded
-by a wall-clock timeout, a heap limit, a host-call budget, a concurrency cap
-and a console cap.
+No cgo. The VM has no network, no environment, an empty read-only filesystem
+and discarded stdio; the libc helpers (`std`, `os`, `print`, `setTimeout`)
+are removed from the global object. Every run is bounded by a wall-clock
+timeout, a heap limit, a host-call budget, a concurrency cap and a console
+cap.
 
 ```
 github.com/thehumanworks/codemode-go           the sandbox (no other dependencies of yours)
@@ -74,14 +76,16 @@ What the script can rely on:
 | Results | the `HostFunc`'s JSON, parsed; an error rejects with its message, so `try/catch` works |
 | Concurrency | `Promise.all` runs calls in parallel, up to `Options.MaxConcurrency` |
 | Return value | serialised to `Output.Result`; `undefined` becomes `null` |
-| Console | `console.log` and friends go to `Output.Logs` (and `Options.OnLog` live); kept even when the script times out |
+| Console | `console.log` and friends go to `Output.Logs` (and `Options.OnLog` live); kept even when the script times out; once `MaxLogChars` is reached, later lines are dropped after a marker |
 | Unknown members | `TypeError: app.gret does not exist. Did you mean app.greet?` plus `Options.Hint` |
 | Stalls | a script awaiting something nothing can settle fails fast instead of hanging |
 
 Errors are typed: `*ScriptError` (thrown value, syntax error, stall, out of
-memory, call limit), `*TimeoutError` (unwraps to `ErrTimeout`), and an error
-wrapping `context.Canceled` when the caller cancels. All of them carry the
-logs and the call count.
+memory, call limit, a tool that panicked), `*TimeoutError` (unwraps to
+`ErrTimeout`; its `Timeout` is the limit that applied, the option or the
+shorter context deadline), and an error wrapping `context.Canceled` when the
+caller cancels. All of them carry the logs and the call count. Stack traces
+use the script's own line numbers.
 
 Globals are extra async functions taking positional arguments, passed to a
 `HostFunc` as a JSON array; `catalog` uses them for `search` and `describe`.
@@ -207,9 +211,26 @@ the sandbox without MCP.
 
 The script runs in a fresh VM each time. The host bridge is installed before
 the script and removed from `globalThis` by the prelude, so the only way out
-is through the namespace methods and the globals you provide. The timeout is
-enforced by closing the WebAssembly module, which stops a tight loop as well
-as a stuck host call; in-flight host calls see their context cancelled.
+is through the namespace methods and the globals you provide; the host does
+not trust the prelude alone and validates the JSON that crosses the bridge
+in both directions. Calls over the budget, unknown names and bad arguments
+are rejected synchronously, so a burst of fire-and-forget calls cannot wedge
+a run. A `HostFunc` that panics rejects the call instead of ending the
+process. The timeout is enforced by closing the WebAssembly module, which
+stops a tight loop as well as a stuck host call; in-flight host calls see
+their context cancelled and get one second to return.
+
+The qjs build ships quickjs-libc. The prelude deletes its globals, the VM's
+filesystem root is an empty read-only directory, stdout and stderr go to
+`io.Discard`, and there is no environment and no network. What remains is
+`import("qjs:os")` or `import("qjs:std")`, which cannot be blocked from
+JavaScript: a script can list the empty directory, fail to write to it,
+call `std.exit` (reported as a `ScriptError`), or sleep with `os.sleep` and
+libc timers. wazero cannot interrupt a sleep, so `Run` returns a
+`TimeoutError` after the deadline plus a one-second grace period and the VM
+goroutine finishes when the sleep does. A qjs build without quickjs-libc
+would close that gap; until then a script can hold a goroutine and the VM's
+memory for at most the length of its sleep.
 
 A script is untrusted input: it can only do what your `HostFunc`s do, so put
 authorisation and rate limits in them, not in the prompt.
@@ -220,11 +241,15 @@ A few facts about the underlying library shaped the implementation and are
 worth knowing if you touch `sandbox.go`:
 
 - The timeout flag (`CloseOnContextDone`) is baked into a process-wide
-  compiled module on the first runtime creation. Every runtime in this package
-  passes it; a runtime created elsewhere without it would silently disable
-  timeouts for later scripts.
+  compiled module on the first runtime creation. `Warm` (which `Run` calls)
+  forces one recompilation with the flag set and then checks that a busy
+  loop stops on its deadline; if a runtime created elsewhere has disabled
+  that, every `Run` returns an error rather than running scripts unbounded.
+- The default options mount the process working directory as the VM's
+  filesystem and connect its stdout and stderr to the real ones; the sandbox
+  overrides all three.
 - Values returned from `Eval` are unreliable for short-lived strings, so the
-  result travels through a global the prelude sets.
+  result travels through a host function the prelude's driver calls.
 - Async host functions resolve synchronously, so host calls use a
   start/wait pump driven by a loop in the prelude that yields to the microtask
   queue between results.
