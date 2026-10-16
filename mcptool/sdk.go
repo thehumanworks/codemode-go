@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -40,8 +41,38 @@ func toolRequest(ctx context.Context, name string, args json.RawMessage) *mcp.Ca
 // be deferred directly.
 func recoverCall(name string, res **mcp.CallToolResult, err *error) {
 	if p := recover(); p != nil {
-		msg, _ := codemode.Clip(fmt.Sprint(p), 500)
-		*res, *err = nil, fmt.Errorf("tool %q panicked: %s", name, msg)
+		*res, *err = nil, errors.New(panicMessage(name, p))
+	}
+}
+
+// panicMessage is the text for a tool handler's panic, clipped.
+func panicMessage(name string, p any) string {
+	msg, _ := codemode.Clip(fmt.Sprint(p), 500)
+	return fmt.Sprintf("tool %q panicked: %s", name, msg)
+}
+
+// guardTyped wraps a typed handler so a panic during a direct client call
+// becomes an error, which the SDK's typed wrapper turns into an error
+// result, instead of ending the process. Script calls get the same
+// treatment in the call closure, so the two paths report the same text.
+func guardTyped[In, Out any](name string, h mcp.ToolHandlerFor[In, Out]) mcp.ToolHandlerFor[In, Out] {
+	return func(ctx context.Context, req *mcp.CallToolRequest, in In) (res *mcp.CallToolResult, out Out, err error) {
+		defer recoverCall(name, &res, &err)
+		return h(ctx, req, in)
+	}
+}
+
+// guard is guardTyped for untyped handlers. The SDK returns an untyped
+// handler's error as a JSON-RPC error, so the panic is reported as an error
+// result directly, which is what a client sees from a typed tool too.
+func guard(name string, h mcp.ToolHandler) mcp.ToolHandler {
+	return func(ctx context.Context, req *mcp.CallToolRequest) (res *mcp.CallToolResult, err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				res, err = &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: panicMessage(name, p)}}, IsError: true}, nil
+			}
+		}()
+		return h(ctx, req)
 	}
 }
 

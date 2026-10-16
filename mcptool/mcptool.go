@@ -212,7 +212,9 @@ func (r *Registry) Mode() Mode { return r.opts.Mode }
 // catalogue share one schema; t itself is not modified. Scripts get what a
 // client gets: input validated with defaults applied, In decoded with
 // case-sensitive field names, output validated against the output schema
-// with defaults applied, and the result shaped the same way.
+// with defaults applied, and the result shaped the same way. A handler that
+// panics, whether called from a script or directly by a client, yields an
+// error result instead of ending the process.
 //
 // It panics, in every mode and before recording anything, where mcp.AddTool
 // would (for example when the input schema is not an object schema), and
@@ -254,15 +256,16 @@ func AddTool[In, Out any](r *Registry, t *mcp.Tool, h mcp.ToolHandlerFor[In, Out
 		}
 		return shapeResult(res, out, elemZero, outResolved)
 	}
-	r.add(&tt, call, func() { mcp.AddTool(r.server, &tt, h) })
+	r.add(&tt, call, func() { mcp.AddTool(r.server, &tt, guardTyped(tt.Name, h)) })
 }
 
 // AddTool records an untyped tool and, unless the mode is only, registers it
 // on the server as (*mcp.Server).AddTool would, using a copy of t. As over
 // the wire, the handler gets the arguments as the script sent them (an
 // empty object when none) with no validation and no defaults, and its
-// result is used as is. It panics where (*mcp.Server).AddTool would, in
-// every mode, and on name collisions like AddTool.
+// result is used as is. Panics in the handler become error results, as for
+// AddTool. It panics where (*mcp.Server).AddTool would, in every mode, and
+// on name collisions like AddTool.
 func (r *Registry) AddTool(t *mcp.Tool, h mcp.ToolHandler) {
 	tt := *t
 	sdkCheck(func(s *mcp.Server) { s.AddTool(&tt, h) })
@@ -270,7 +273,7 @@ func (r *Registry) AddTool(t *mcp.Tool, h mcp.ToolHandler) {
 		defer recoverCall(tt.Name, &res, &err)
 		return h(ctx, toolRequest(ctx, tt.Name, objectArgs(args)))
 	}
-	r.add(&tt, call, func() { r.server.AddTool(&tt, h) })
+	r.add(&tt, call, func() { r.server.AddTool(&tt, guard(tt.Name, h)) })
 }
 
 // add records a checked tool and, unless the mode is only, registers it on

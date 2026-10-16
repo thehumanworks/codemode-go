@@ -789,3 +789,48 @@ func TestParamsAndTimeoutDefaults(t *testing.T) {
 		t.Errorf("unresolvable param schema: %q", msg)
 	}
 }
+
+// A handler that panics during a direct client call yields an error result
+// with the same text as a script call, and the server keeps serving.
+func TestWirePanicsAreErrorResults(t *testing.T) {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+	reg := New(srv, Options{})
+	AddTool(reg, &mcp.Tool{Name: "typed_boom"}, func(context.Context, *mcp.CallToolRequest, struct {
+		N int `json:"n,omitempty"`
+	}) (*mcp.CallToolResult, any, error) {
+		panic("typed kaboom")
+	})
+	reg.AddTool(&mcp.Tool{Name: "raw_boom", InputSchema: &jsonschema.Schema{Type: "object"}}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		var m map[string]int
+		m["x"]++ // nil map write
+		return nil, nil
+	})
+	AddTool(reg, &mcp.Tool{Name: "ok"}, func(context.Context, *mcp.CallToolRequest, any) (*mcp.CallToolResult, any, error) {
+		return nil, map[string]any{"ok": true}, nil
+	})
+	reg.Register()
+	cs := connect(t, srv)
+
+	for name, want := range map[string]string{
+		"typed_boom": `tool "typed_boom" panicked: typed kaboom`,
+		"raw_boom":   `tool "raw_boom" panicked: assignment to entry in nil map`,
+	} {
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: map[string]any{}})
+		if err != nil {
+			t.Fatalf("%s: transport error %v", name, err)
+		}
+		if !res.IsError || len(res.Content) != 1 || res.Content[0].(*mcp.TextContent).Text != want {
+			b, _ := json.Marshal(res)
+			t.Errorf("%s: %s", name, b)
+		}
+		// Through a script the same text comes back as the rejection.
+		st, text, isErr := callCode(t, cs, "code", `try { await tools.`+name+`({}); return "no error"; } catch (e) { return e.message; }`, nil)
+		if isErr || st["result"] != want {
+			t.Errorf("%s via script: %v %s", name, st["result"], text)
+		}
+	}
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ok", Arguments: map[string]any{}})
+	if err != nil || res.IsError {
+		t.Fatalf("server after panics: %v %v", err, res)
+	}
+}
