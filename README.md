@@ -268,11 +268,20 @@ worth knowing if you touch `sandbox.go`:
 
 ## Development
 
+`mise.toml` declares the toolchain: `mise install` fetches the Go version
+go.mod asks for and the tools that rebuild the QuickJS module, then
+
 ```sh
-go test ./...          # unit tests for every package, offline
-go test -race ./...
-go vet ./... && gofmt -l .
+mise run test   # go test -race ./... for every package, offline
+mise run lint   # gofmt and go vet
+mise run wasm   # rebuild wasm/qjs.wasm, see wasm/README.md
 ```
+
+Plain `go test ./...` works with any Go matching go.mod; the committed
+module needs no build tools. `flake.nix` offers the same through Nix
+(`nix develop`, `nix build`, `nix build .#qjs-wasm`); it was written without
+a Nix installation to test it on, so expect to fill in the `vendorHash` it
+asks for on the first build.
 
 `DESIGN.md` holds the API contract the packages are built to.
 `wasm/README.md` documents the embedded QuickJS build and how to rebuild it.

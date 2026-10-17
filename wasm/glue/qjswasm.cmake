@@ -44,6 +44,13 @@ set_target_properties(qjswasm PROPERTIES
     OUTPUT_NAME "qjswasm"
 )
 
+# clang runs wasm-opt itself after linking when it finds one on PATH, which
+# would optimise the module twice and make the result depend on the
+# environment. The build script runs wasm-opt exactly once instead. (Set on
+# the target: directory-level add_link_options only reach targets created
+# after the call, and qjswasm is created above.)
+target_link_options(qjswasm PRIVATE --no-wasm-opt)
+
 target_link_options(qjswasm PRIVATE 
     "LINKER:--export=js_std_await"
     "LINKER:--export=New_QJS"

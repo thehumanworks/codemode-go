@@ -1,0 +1,31 @@
+# Toolchain for codemode-go. `mise install` fetches everything below and
+# `mise tasks` lists the project tasks.
+[tools]
+go = "1.27" # matches the go directive in go.mod
+
+# Only needed to rebuild wasm/qjs.wasm (wasm/README.md); go build and go test
+# use the committed module as is.
+cmake = "3.31"                                                                                              # configures the QuickJS-ng build
+ninja = "1.12"                                                                                              # drives it
+"github:WebAssembly/binaryen" = { version = "133", version_prefix = "version_" }                             # wasm-opt shrinks the module
+"github:WebAssembly/wasi-sdk" = { version = "34", version_prefix = "wasi-sdk-", filter_bins = "wasm-ld" } # clang and sysroot for wasm32-wasip1; its clang stays off PATH (it would shadow the host compiler), the build script finds it through WASI_SDK
+
+[env]
+# The build script reads the SDK location from here. Empty until the SDK is
+# installed, so the other tasks work without it.
+WASI_SDK = { value = "{% if tools['github:WebAssembly/wasi-sdk'] is defined %}{{ tools['github:WebAssembly/wasi-sdk'].path }}{% endif %}", tools = true }
+
+[tasks.test]
+description = "Unit tests for every package, offline, with the race detector"
+run = "go test -race -count=1 ./..."
+
+[tasks.lint]
+description = "gofmt and go vet"
+run = [
+  "test -z \"$(gofmt -l .)\" || { gofmt -l .; exit 1; }",
+  "go vet ./...",
+]
+
+[tasks.wasm]
+description = "Rebuild wasm/qjs.wasm from the pinned QuickJS-ng and the glue"
+run = "./wasm/build.sh"

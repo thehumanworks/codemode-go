@@ -2,12 +2,17 @@
 # Rebuilds wasm/qjs.wasm: QuickJS-ng without quickjs-libc, with the
 # fastschema/qjs glue from wasm/glue. See wasm/README.md.
 #
-# Needs: git, cmake, ninja, a wasi-sdk (WASI_SDK=/path/to/wasi-sdk-NN.N-...)
-# and, for the committed size, wasm-opt (binaryen). Run from anywhere.
+# Needs: git, cmake, ninja, wasm-opt (binaryen) and a wasi-sdk
+# (WASI_SDK=/path/to/wasi-sdk-NN.N-...). `mise install` in the repository
+# provides all of them and sets WASI_SDK; `mise run wasm` runs this script.
+# Run from anywhere. The output is reproducible: same inputs, same bytes.
 set -euo pipefail
 
 QUICKJS_NG_COMMIT=d01ca4491fb24ccfeccb4c7394e28a3b21fd5986 # fastschema/qjs v0.0.6's submodule pin
-: "${WASI_SDK:?set WASI_SDK to the wasi-sdk directory (its share/cmake holds wasi-sdk-p1.cmake)}"
+: "${WASI_SDK:?set WASI_SDK to the wasi-sdk directory (its share/cmake holds wasi-sdk-p1.cmake), or run 'mise install' and 'mise run wasm'}"
+for tool in git cmake ninja wasm-opt; do
+  command -v "$tool" >/dev/null || { echo "$tool not found on PATH ('mise install' provides it)" >&2; exit 1; }
+done
 
 here=$(cd "$(dirname "$0")" && pwd)
 build="$here/build"
@@ -28,12 +33,9 @@ cmake -S "$build/quickjs" -B "$build/quickjs/build" -G Ninja \
 ninja -C "$build/quickjs/build" qjswasm
 
 out="$here/qjs.wasm"
-if command -v wasm-opt >/dev/null; then
-  wasm-opt -O3 "$build/quickjs/build/qjswasm" -o "$out"
-else
-  echo "wasm-opt not found: copying the unoptimised module (about 15% larger)" >&2
-  cp "$build/quickjs/build/qjswasm" "$out"
-fi
+# The one and only optimisation pass; the glue links with --no-wasm-opt so
+# clang does not run its own when wasm-opt is on PATH.
+wasm-opt -O3 "$build/quickjs/build/qjswasm" -o "$out"
 rm -rf "$build"
 ls -l "$out"
 shasum -a 256 "$out"
