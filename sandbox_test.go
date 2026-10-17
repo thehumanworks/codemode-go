@@ -1,6 +1,7 @@
 package codemode
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -470,5 +471,18 @@ func TestWarmSelfTest(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(sandboxRoot); len(entries) != 0 {
 		t.Errorf("sandbox root is not empty: %d entries", len(entries))
+	}
+}
+
+// TestWasmIsStripped guards the link flags of the embedded module. The
+// prebuilt compiler-rt in a wasi-sdk release carries DWARF with the build
+// paths of the machine that produced that release, which made the module
+// differ between hosts and 270 KB larger until the glue linked with
+// --strip-debug.
+func TestWasmIsStripped(t *testing.T) {
+	for _, s := range []string{".debug_info", ".debug_str", ".debug_line", "/Users/runner/", "/src/src/", "wasi-sdk/"} {
+		if bytes.Contains(qjsWasm, []byte(s)) {
+			t.Errorf("embedded module contains %q", s)
+		}
 	}
 }

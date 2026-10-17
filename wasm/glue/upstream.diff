@@ -263,7 +263,7 @@ index d30e8e4..d1facdf 100644
  #include <time.h>
  
 diff --git a/qjswasm/qjswasm.cmake b/qjswasm/qjswasm.cmake
-index 8fd8607..de76769 100644
+index 8fd8607..bd7a5cf 100644
 --- a/qjswasm/qjswasm.cmake
 +++ b/qjswasm/qjswasm.cmake
 @@ -1,8 +1,3 @@
@@ -275,7 +275,7 @@ index 8fd8607..de76769 100644
  macro(add_static_if_needed target)
      if(QJS_BUILD_CLI_STATIC OR MINGW)
          target_link_options(${target} PRIVATE -static)
-@@ -43,13 +38,19 @@ add_executable(qjswasm
+@@ -43,13 +38,26 @@ add_executable(qjswasm
      ../qjs.c
  )
  
@@ -292,6 +292,13 @@ index 8fd8607..de76769 100644
 +# the target: directory-level add_link_options only reach targets created
 +# after the call, and qjswasm is created above.)
 +target_link_options(qjswasm PRIVATE --no-wasm-opt)
++
++# The prebuilt compiler-rt in a wasi-sdk release carries DWARF with the build
++# paths of the machine that produced that release, which differ between the
++# Linux and macOS tarballs, and wasm-opt keeps DWARF it cannot update. Strip
++# debug sections at link time: the module is ~270 KB smaller and the same on
++# every host.
++target_link_options(qjswasm PRIVATE "LINKER:--strip-debug")
 +
  target_link_options(qjswasm PRIVATE 
      "LINKER:--export=js_std_await"

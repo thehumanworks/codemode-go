@@ -51,6 +51,13 @@ set_target_properties(qjswasm PROPERTIES
 # after the call, and qjswasm is created above.)
 target_link_options(qjswasm PRIVATE --no-wasm-opt)
 
+# The prebuilt compiler-rt in a wasi-sdk release carries DWARF with the build
+# paths of the machine that produced that release, which differ between the
+# Linux and macOS tarballs, and wasm-opt keeps DWARF it cannot update. Strip
+# debug sections at link time: the module is ~270 KB smaller and the same on
+# every host.
+target_link_options(qjswasm PRIVATE "LINKER:--strip-debug")
+
 target_link_options(qjswasm PRIVATE 
     "LINKER:--export=js_std_await"
     "LINKER:--export=New_QJS"
