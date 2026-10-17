@@ -18,11 +18,21 @@ jobs:
       - run: mise run test
   wasm:
     # The committed wasm/qjs.wasm must be reproducible from the pinned
-    # sources and the toolchain mise.toml declares.
-    runs-on: ubuntu-latest
+    # sources and the toolchain mise.toml declares. Each wasi-sdk release
+    # tarball ships its own prebuilt compiler-rt, which differs between
+    # hosts, so the bytes are compared on arm64 macOS, where the module was
+    # built; Linux checks that the toolchain works there and reports.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: jdx/mise-action@v5
       - run: mise run wasm
       - name: committed module is up to date
+        if: runner.os == 'macOS'
         run: git diff --exit-code --stat wasm/qjs.wasm
+      - name: report the Linux build
+        if: runner.os == 'Linux'
+        run: git diff --stat wasm/qjs.wasm || true

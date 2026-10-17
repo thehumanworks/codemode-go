@@ -77,9 +77,13 @@ Without mise, point `WASI_SDK` at an unpacked wasi-sdk release and run
 clones quickjs-ng at the pinned commit into `wasm/build/` (ignored by git),
 copies `glue/` next to it, configures with the wasi-sdk toolchain file,
 builds the `qjswasm` target, optimises with `wasm-opt` when present, writes
-`wasm/qjs.wasm` and prints its SHA-256. The build is reproducible: CI
-rebuilds the module on Linux and fails when it differs from the committed
-one. Run `go test ./...` afterwards: `TestWasmHasNoLibc` and
+`wasm/qjs.wasm` and prints its SHA-256. The build is reproducible on a
+given host platform: the same inputs give the same bytes, and CI rebuilds
+the module on arm64 macOS and fails when it differs from the committed one.
+Each wasi-sdk release tarball ships its own prebuilt `compiler-rt`, with
+that host's build paths inside, so the Linux SDK produces a module that
+behaves the same but is not byte-identical; commit modules built on arm64
+macOS. Run `go test ./...` afterwards: `TestWasmHasNoLibc` and
 `TestSandboxIsolation` check the module itself.
 
 With Nix, `nix build .#qjs-wasm` builds the same sources with nixpkgs'
